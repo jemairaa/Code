@@ -1,0 +1,325 @@
+"""
+pipeline_analyzer.py
+
+Walks a folder of numbered Python pipeline scripts (01_*.py, 02_*.py, ...) and
+produces a markdown 'cheat sheet' that explains each script: its functions,
+docstrings, inputs (files read, CLI args, imports), and outputs (files written).
+
+Usage:
+    python pipeline_analyzer.py /path/to/pipeline_folder
+    python pipeline_analyzer.py /path/to/pipeline_folder -o overview.md
+
+No external dependencies — uses only the standard library.
+"""
+
+import argparse
+import ast
+import re
+from pathlib import Path
+from typing import Optional
+
+
+# ---------- File I/O detection ----------
+
+# Common patterns that suggest a file is being read or written.
+READ_FUNCS = {
+    "read_csv", "read_excel", "read_parquet", "read_json", "read_pickle",
+    "read_feather", "read_html", "read_sql", "read_table", "load", "loads",
+    "load_workbook", "imread",
+}
+WRITE_FUNCS = {
+    "to_csv", "to_excel", "to_parquet", "to_json", "to_pickle", "to_feather",
+    "to_sql", "to_html", "dump", "dumps", "save", "savefig", "imwrite",
+    "write", "writelines",
+}
+
+
+class ScriptInfo:
+    """Container for everything we learn about a single script."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+        self.docstring: Optional[str] = None
+        self.imports: list[str] = []          # external libraries
+        self.local_imports: list[str] = []    # imports from sibling files
+        self.functions: list[dict] = []       # {name, args, docstring, lineno}
+        self.classes: list[dict] = []         # {name, methods, docstring}
+        self.files_read: list[str] = []       # detected reads
+        self.files_written: list[str] = []    # detected writes
+        self.cli_args: list[str] = []         # argparse args
+        self.has_main_block: bool = False
+        self.entry_calls: list[str] = []      # top-level function calls
+        self.line_count: int = 0
+
+
+def get_arg_name(arg_node) -> str:
+    """Render a function argument as 'name: type = default' (best effort)."""
+    name = arg_node.arg
+    annotation = ""
+    if arg_node.annotation is not None:
+        try:
+            annotation = f": {ast.unparse(arg_node.annotation)}"
+        except Exception:
+            annotation = ""
+    return f"{name}{annotation}"
+
+
+def extract_string_arg(node) -> Optional[str]:
+    """If a call has a string literal as its first arg, return it."""
+    if not node.args:
+        return None
+    first = node.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value
+    return None
+
+
+def looks_like_path(s: str) -> bool:
+    """Heuristic: does this string look like a file path or filename?"""
+    if not s or len(s) > 300:
+        return False
+    if "/" in s or "\\" in s:
+        return True
+    # plain filename like data.csv
+    return bool(re.search(r"\.\w{1,6}$", s))
+
+
+def analyze_script(path: Path, sibling_module_names: set[str]) -> ScriptInfo:
+    """Parse one .py file and pull out everything useful."""
+    info = ScriptInfo(path)
+    source = path.read_text(encoding="utf-8", errors="replace")
+    info.line_count = source.count("\n") + 1
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as e:
+        info.docstring = f"(could not parse: {e})"
+        return info
+
+    info.docstring = ast.get_docstring(tree)
+
+    for node in ast.walk(tree):
+        # --- imports ---
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in sibling_module_names:
+                    info.local_imports.append(alias.name)
+                else:
+                    info.imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            top = module.split(".")[0]
+            if top in sibling_module_names or node.level > 0:
+                info.local_imports.append(module or "(relative)")
+            else:
+                info.imports.append(module)
+
+        # --- argparse CLI arguments ---
+        elif isinstance(node, ast.Call):
+            func = node.func
+            attr = func.attr if isinstance(func, ast.Attribute) else None
+
+            if attr == "add_argument":
+                arg_name = extract_string_arg(node)
+                if arg_name:
+                    info.cli_args.append(arg_name)
+
+            # File reads / writes via method calls (df.to_csv, json.load, etc.)
+            if attr in READ_FUNCS:
+                path_arg = extract_string_arg(node)
+                if path_arg and looks_like_path(path_arg):
+                    info.files_read.append(path_arg)
+            elif attr in WRITE_FUNCS:
+                path_arg = extract_string_arg(node)
+                if path_arg and looks_like_path(path_arg):
+                    info.files_written.append(path_arg)
+
+            # open(...) calls — check mode for read vs write
+            if isinstance(func, ast.Name) and func.id == "open":
+                path_arg = extract_string_arg(node)
+                if path_arg and looks_like_path(path_arg):
+                    mode = "r"
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                        mode = str(node.args[1].value)
+                    for kw in node.keywords:
+                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                            mode = str(kw.value.value)
+                    if any(c in mode for c in "wax"):
+                        info.files_written.append(path_arg)
+                    else:
+                        info.files_read.append(path_arg)
+
+    # --- top-level functions, classes, and main block ---
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+            info.functions.append({
+                "name": node.name,
+                "args": [get_arg_name(a) for a in node.args.args],
+                "docstring": ast.get_docstring(node),
+                "lineno": node.lineno,
+            })
+        elif isinstance(node, ast.ClassDef):
+            methods = [
+                n.name for n in node.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            info.classes.append({
+                "name": node.name,
+                "methods": methods,
+                "docstring": ast.get_docstring(node),
+            })
+        elif isinstance(node, ast.If):
+            # Detect `if __name__ == "__main__":`
+            test = node.test
+            if (isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == "__name__"):
+                info.has_main_block = True
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            if isinstance(call.func, ast.Name):
+                info.entry_calls.append(call.func.id)
+            elif isinstance(call.func, ast.Attribute):
+                info.entry_calls.append(call.func.attr)
+
+    # Dedupe while preserving order
+    def dedupe(seq):
+        seen = set()
+        return [x for x in seq if not (x in seen or seen.add(x))]
+
+    info.imports = dedupe(info.imports)
+    info.local_imports = dedupe(info.local_imports)
+    info.files_read = dedupe(info.files_read)
+    info.files_written = dedupe(info.files_written)
+    info.cli_args = dedupe(info.cli_args)
+    info.entry_calls = dedupe(info.entry_calls)
+    return info
+
+
+# ---------- Markdown rendering ----------
+
+def render_markdown(scripts: list[ScriptInfo], folder: Path) -> str:
+    lines = []
+    lines.append(f"# Pipeline Overview: `{folder.name}`\n")
+    lines.append(f"_{len(scripts)} scripts analyzed_\n")
+
+    # ---- Top-level summary table ----
+    lines.append("## Pipeline at a glance\n")
+    lines.append("| # | Script | Purpose (first docstring line) | Reads | Writes |")
+    lines.append("|---|--------|--------------------------------|-------|--------|")
+    for s in scripts:
+        purpose = (s.docstring or "").strip().split("\n")[0][:80] or "_(no docstring)_"
+        reads = ", ".join(s.files_read) or "—"
+        writes = ", ".join(s.files_written) or "—"
+        lines.append(f"| {s.name[:2]} | `{s.name}` | {purpose} | {reads} | {writes} |")
+    lines.append("")
+
+    # ---- Inferred data flow ----
+    lines.append("## Inferred data flow\n")
+    lines.append(
+        "Files written by one script and read by a later script suggest a "
+        "hand-off between them.\n"
+    )
+    write_map: dict[str, str] = {}  # filename -> script that writes it
+    handoffs = []
+    for s in scripts:
+        for f in s.files_written:
+            write_map[Path(f).name] = s.name
+        for f in s.files_read:
+            base = Path(f).name
+            if base in write_map and write_map[base] != s.name:
+                handoffs.append((write_map[base], base, s.name))
+    if handoffs:
+        for producer, filename, consumer in handoffs:
+            lines.append(f"- `{producer}` → **{filename}** → `{consumer}`")
+    else:
+        lines.append("_No file-based hand-offs detected. Pipeline may pass data in-memory, "
+                     "use a shared module, or write to paths built dynamically._")
+    lines.append("")
+
+    # ---- Per-script detail ----
+    lines.append("## Script-by-script detail\n")
+    for s in scripts:
+        lines.append(f"### `{s.name}` ({s.line_count} lines)\n")
+
+        if s.docstring:
+            lines.append(f"> {s.docstring.strip()}\n")
+        else:
+            lines.append("> _No module docstring._\n")
+
+        if s.imports:
+            lines.append(f"**External libraries:** {', '.join(f'`{i}`' for i in s.imports)}\n")
+        if s.local_imports:
+            lines.append(f"**Imports from siblings:** {', '.join(f'`{i}`' for i in s.local_imports)}\n")
+
+        if s.cli_args:
+            lines.append(f"**CLI arguments:** {', '.join(f'`{a}`' for a in s.cli_args)}\n")
+
+        if s.files_read:
+            lines.append("**Reads:**")
+            for f in s.files_read:
+                lines.append(f"- `{f}`")
+            lines.append("")
+        if s.files_written:
+            lines.append("**Writes:**")
+            for f in s.files_written:
+                lines.append(f"- `{f}`")
+            lines.append("")
+
+        if s.functions:
+            lines.append("**Functions defined:**")
+            for fn in s.functions:
+                sig = f"`{fn['name']}({', '.join(fn['args'])})`"
+                doc = fn["docstring"].strip().split("\n")[0] if fn["docstring"] else ""
+                lines.append(f"- {sig} — {doc}" if doc else f"- {sig}")
+            lines.append("")
+
+        if s.classes:
+            lines.append("**Classes defined:**")
+            for c in s.classes:
+                methods = ", ".join(c["methods"]) or "_no methods_"
+                lines.append(f"- `{c['name']}` — methods: {methods}")
+            lines.append("")
+
+        if s.has_main_block:
+            lines.append("**Has `if __name__ == \"__main__\":` block** — runnable as a script.\n")
+        elif s.entry_calls:
+            lines.append(f"**Top-level calls:** {', '.join(f'`{c}()`' for c in s.entry_calls)}\n")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
+# ---------- Main ----------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("folder", help="Path to folder containing pipeline .py files")
+    parser.add_argument("-o", "--output", default="pipeline_overview.md",
+                        help="Output markdown file (default: pipeline_overview.md)")
+    args = parser.parse_args()
+
+    folder = Path(args.folder).resolve()
+    if not folder.is_dir():
+        raise SystemExit(f"Not a directory: {folder}")
+
+    py_files = sorted(folder.glob("*.py"))
+    py_files = [p for p in py_files if p.name != Path(__file__).name]
+    if not py_files:
+        raise SystemExit(f"No .py files found in {folder}")
+
+    sibling_names = {p.stem for p in py_files}
+    scripts = [analyze_script(p, sibling_names) for p in py_files]
+
+    output = render_markdown(scripts, folder)
+    out_path = Path(args.output).resolve()
+    out_path.write_text(output, encoding="utf-8")
+    print(f"Wrote {out_path}")
+    print(f"Analyzed {len(scripts)} script(s).")
+
+
+if __name__ == "__main__":
+    main()
