@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""
+Pipeline Analyzer: Extract execution order, I/O, and dependencies from Python scripts.
+Generates Mermaid flowcharts and Markdown documentation for onboarding.
+
+Usage:
+    python analyze_pipeline.py <path_to_scripts_dir> [--config config.yaml]
+"""
+
+import ast
+import sys
+import json
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+import re
+
+
+@dataclass
+class ScriptAnalysis:
+    """Container for extracted script metadata."""
+    name: str
+    order: int
+    purpose: str = ""
+    inputs: List[str] = None
+    outputs: List[str] = None
+    imports_from: List[str] = None  # Other scripts this imports from
+    calls: List[str] = None  # Functions/classes from other scripts
+    functions: List[str] = None  # Public functions defined
+    classes: List[str] = None  # Classes defined
+
+    def __post_init__(self):
+        if self.inputs is None:
+            self.inputs = []
+        if self.outputs is None:
+            self.outputs = []
+        if self.imports_from is None:
+            self.imports_from = []
+        if self.calls is None:
+            self.calls = []
+        if self.functions is None:
+            self.functions = []
+        if self.classes is None:
+            self.classes = []
+
+
+class PythonFileAnalyzer(ast.NodeVisitor):
+    """AST visitor to extract imports, functions, classes, and file I/O patterns."""
+
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.imports = []  # Import statements
+        self.functions = []  # Function names
+        self.classes = []  # Class names
+        self.io_reads = []  # Files/resources being read
+        self.io_writes = []  # Files/resources being written
+        self.external_calls = []  # Calls to external modules
+
+    def visit_Import(self, node):
+        """Extract import names."""
+        for alias in node.names:
+            self.imports.append(alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        """Extract from...import statements."""
+        if node.module:
+            self.imports.append(node.module)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        """Extract function definitions."""
+        self.functions.append(node.name)
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        """Extract class definitions."""
+        self.classes.append(node.name)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        """Track function calls to detect dependencies."""
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                self.external_calls.append(node.func.value.id)
+        self.generic_visit(node)
+
+    def visit_Constant(self, node):
+        """Detect file operations in string literals."""
+        if isinstance(node.value, str):
+            # Very basic file detection (improve as needed)
+            if any(ext in node.value for ext in ['.csv', '.json', '.pkl', '.txt', '.parquet']):
+                self.io_reads.append(node.value)
+        self.generic_visit(node)
+
+    def extract(self) -> Dict:
+        """Return extracted metadata."""
+        return {
+            'imports': list(set(self.imports)),
+            'functions': self.functions,
+            'classes': self.classes,
+            'io_reads': self.io_reads,
+            'io_writes': self.io_writes,
+            'external_calls': list(set(self.external_calls))
+        }
+
+
+class PipelineAnalyzer:
+    """Analyze a pipeline of Python scripts and generate documentation."""
+
+    def __init__(self, script_dir: str):
+        self.script_dir = Path(script_dir)
+        if not self.script_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {script_dir}")
+        
+        self.scripts: Dict[int, ScriptAnalysis] = {}
+        self.script_files: Dict[int, Path] = {}
+
+    def discover_scripts(self) -> None:
+        """Find all .py files and sort by execution order (filename prefix)."""
+        py_files = sorted(self.script_dir.glob("*.py"))
+        
+        for idx, filepath in enumerate(py_files, start=1):
+            # Try to extract order from filename (e.g., "01_fetch.py" → 1)
+            match = re.match(r'^(\d+)', filepath.stem)
+            order = int(match.group(1)) if match else idx
+            
+            self.script_files[order] = filepath
+            self.scripts[order] = ScriptAnalysis(
+                name=filepath.stem,
+                order=order
+            )
+
+    def analyze_file(self, order: int) -> Dict:
+        """Parse a Python file and extract metadata."""
+        filepath = self.script_files[order]
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                source = f.read()
+        except Exception as e:
+            print(f"⚠️  Could not read {filepath}: {e}")
+            return {}
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as e:
+            print(f"⚠️  Syntax error in {filepath}: {e}")
+            return {}
+
+        analyzer = PythonFileAnalyzer(filepath.name)
+        analyzer.visit(tree)
+        
+        # Extract docstring (module purpose)
+        docstring = ast.get_docstring(tree) or ""
+        
+        return {
+            'docstring': docstring,
+            **analyzer.extract()
+        }
+
+    def detect_dependencies(self) -> None:
+        """Identify which scripts import from which."""
+        script_names = {order: self.scripts[order].name for order in self.scripts}
+        
+        for order in self.scripts:
+            metadata = self.analyze_file(order)
+            
+            # Extract docstring as purpose
+            if metadata.get('docstring'):
+                self.scripts[order].purpose = metadata['docstring'][:150]
+            
+            # Store functions/classes
+            self.scripts[order].functions = metadata.get('functions', [])
+            self.scripts[order].classes = metadata.get('classes', [])
+            
+            # Detect imports from other local scripts
+            for import_name in metadata.get('imports', []):
+                for other_order, other_name in script_names.items():
+                    if import_name == other_name or import_name.startswith(other_name):
+                        self.scripts[order].imports_from.append(other_name)
+
+    def generate_mermaid_flowchart(self) -> str:
+        """Generate Mermaid flowchart showing execution order and data flow."""
+        lines = ["flowchart TD", ""]
+        
+        sorted_scripts = sorted(self.scripts.items())
+        
+        for idx, (order, script) in enumerate(sorted_scripts):
+            # Node definition
+            node_id = f"S{order}"
+            label = f"{order}. {script.name}"
+            lines.append(f'    {node_id}["{label}"]')
+            
+            # Add edges to next script
+            if idx < len(sorted_scripts) - 1:
+                next_order = sorted_scripts[idx + 1][0]
+                next_node_id = f"S{next_order}"
+                
+                # Add data flow info if available
+                output_str = ', '.join(script.outputs[:2]) if script.outputs else ""
+                edge_label = f"→ {output_str}" if output_str else ""
+                
+                if edge_label:
+                    lines.append(f'    {node_id} -->|"{edge_label}"| {next_node_id}')
+                else:
+                    lines.append(f'    {node_id} --> {next_node_id}')
+        
+        return '\n'.join(lines)
+
+    def generate_markdown(self) -> str:
+        """Generate comprehensive Markdown documentation."""
+        lines = []
+        lines.append("# Pipeline Execution Guide\n")
+        
+        # Overview
+        lines.append("## Overview\n")
+        sorted_scripts = sorted(self.scripts.items())
+        for order, script in sorted_scripts:
+            purpose = script.purpose or "(no description available)"
+            lines.append(f"**{order}. {script.name}** — {purpose}\n")
+        
+        lines.append("\n")
+        
+        # Detailed steps
+        lines.append("## Detailed Steps\n")
+        for order, script in sorted_scripts:
+            lines.append(f"### Step {order}: {script.name}\n")
+            
+            if script.purpose:
+                lines.append(f"**Purpose:** {script.purpose}\n\n")
+            
+            if script.inputs:
+                lines.append(f"**Inputs:**\n")
+                for inp in script.inputs:
+                    lines.append(f"- `{inp}`\n")
+                lines.append("\n")
+            
+            if script.outputs:
+                lines.append(f"**Outputs:**\n")
+                for out in script.outputs:
+                    lines.append(f"- `{out}`\n")
+                lines.append("\n")
+            
+            if script.imports_from:
+                lines.append(f"**Depends on:** {', '.join(script.imports_from)}\n\n")
+            
+            if script.functions:
+                lines.append(f"**Key functions:** `{', '.join(script.functions[:5])}`\n\n")
+            
+            lines.append("---\n\n")
+        
+        # Dependency graph
+        lines.append("## Dependency Graph\n\n")
+        lines.append("```mermaid\n")
+        lines.append(self.generate_mermaid_flowchart())
+        lines.append("\n```\n")
+        
+        return ''.join(lines)
+
+    def run(self) -> Tuple[str, str]:
+        """Run full analysis and return (markdown, mermaid_code)."""
+        print(f"🔍 Scanning {self.script_dir}...")
+        self.discover_scripts()
+        
+        if not self.scripts:
+            raise ValueError(f"No .py files found in {self.script_dir}")
+        
+        print(f"📊 Analyzing {len(self.scripts)} scripts...")
+        self.detect_dependencies()
+        
+        markdown = self.generate_markdown()
+        mermaid = self.generate_mermaid_flowchart()
+        
+        return markdown, mermaid
+
+
+class ConfigManager:
+    """Load/save metadata config for manual overrides."""
+
+    @staticmethod
+    def load_config(filepath: str) -> Dict:
+        """Load YAML/JSON config with script metadata."""
+        path = Path(filepath)
+        if not path.exists():
+            return {}
+        
+        try:
+            if path.suffix == '.json':
+                with open(path) as f:
+                    return json.load(f)
+            elif path.suffix in ['.yaml', '.yml']:
+                import yaml
+                with open(path) as f:
+                    return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"⚠️  Could not load config: {e}")
+        
+        return {}
+
+    @staticmethod
+    def save_config_template(output_path: str, scripts: Dict[int, ScriptAnalysis]) -> None:
+        """Generate a template config file for users to fill in."""
+        template = {
+            "scripts": {
+                str(order): {
+                    "name": script.name,
+                    "purpose": "EDIT THIS: Brief description of what this script does",
+                    "inputs": script.inputs or ["input_file.csv"],
+                    "outputs": script.outputs or ["output_file.csv"],
+                    "dependencies": script.imports_from or [],
+                }
+                for order, script in sorted(scripts.items())
+            }
+        }
+        
+        with open(output_path, 'w') as f:
+            json.dump(template, f, indent=2)
+        
+        print(f"✅ Config template saved to {output_path}")
+
+
+def main():
+    """CLI entry point."""
+    if len(sys.argv) < 2:
+        print("Usage: python analyze_pipeline.py <scripts_directory> [--config config.json]")
+        print("\nExample:")
+        print("  python analyze_pipeline.py ./my_pipeline")
+        print("  python analyze_pipeline.py ./my_pipeline --config pipeline_config.json")
+        sys.exit(1)
+
+    script_dir = sys.argv[1]
+    config_file = None
+    
+    if '--config' in sys.argv:
+        config_file = sys.argv[sys.argv.index('--config') + 1]
+
+    try:
+        analyzer = PipelineAnalyzer(script_dir)
+        markdown, mermaid = analyzer.run()
+        
+        # Save outputs
+        output_md = Path("PIPELINE_GUIDE.md")
+        output_md.write_text(markdown)
+        print(f"✅ Documentation saved to {output_md}")
+        
+        # Also save just the mermaid code
+        output_mermaid = Path("pipeline_flowchart.mmd")
+        output_mermaid.write_text(mermaid)
+        print(f"✅ Flowchart saved to {output_mermaid}")
+        
+        # Save config template
+        ConfigManager.save_config_template("pipeline_config.json", analyzer.scripts)
+        
+        print("\n📋 Next steps:")
+        print("  1. Edit 'pipeline_config.json' to add detailed inputs/outputs")
+        print("  2. Run again with: python analyze_pipeline.py . --config pipeline_config.json")
+        print("  3. Open 'PIPELINE_GUIDE.md' in your editor or GitHub")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
