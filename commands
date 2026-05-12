@@ -4,3 +4,5 @@ Get-ChildItem "$env:LOCALAPPDATA\Programs\Graphviz" -ErrorAction SilentlyContinu
 
 $env:Path += ";C:\Program Files\Graphviz\bin"
 dot -V
+
+pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
