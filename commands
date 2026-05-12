@@ -1,0 +1,2 @@
+Get-ChildItem "C:\Program Files\Graphviz" -ErrorAction SilentlyContinue
+Get-ChildItem "$env:LOCALAPPDATA\Programs\Graphviz" -ErrorAction SilentlyContinue
