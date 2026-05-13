@@ -1,14 +1,6 @@
-Get-ChildItem "C:\Program Files\Graphviz" -ErrorAction SilentlyContinue
-Get-ChildItem "$env:LOCALAPPDATA\Programs\Graphviz" -ErrorAction SilentlyContinue
+& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" .\ATHENA_Scripts\*.py -o pipeline_calls.svg
 
+$env:Path += ";$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts"
+code2flow .\ATHENA_Scripts\*.py -o pipeline_calls.svg
 
-$env:Path += ";C:\Program Files\Graphviz\bin"
-dot -V
-
-pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
-
-python -m pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
-
-py -m pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
-
-python -m code2flow .\ATHENA_Scripts\*.py -o pipeline_calls.svg
+& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" (Get-ChildItem .\ATHENA_Scripts\*.py).FullName -o pipeline_calls.svg
