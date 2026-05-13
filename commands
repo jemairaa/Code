@@ -6,3 +6,9 @@ $env:Path += ";C:\Program Files\Graphviz\bin"
 dot -V
 
 pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
+
+python -m pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
+
+py -m pydeps .\ATHENA_Scripts --max-bacon=2 --cluster -o pipeline_deps.svg --noshow
+
+python -m code2flow .\ATHENA_Scripts\*.py -o pipeline_calls.svg
