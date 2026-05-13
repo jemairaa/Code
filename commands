@@ -4,3 +4,6 @@ $env:Path += ";$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts"
 code2flow .\ATHENA_Scripts\*.py -o pipeline_calls.svg
 
 & "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" (Get-ChildItem .\ATHENA_Scripts\*.py).FullName -o pipeline_calls.svg
+
+
+& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" (Get-ChildItem .\ATHENA_Scripts\*.py).FullName -o pipeline_calls.svg
