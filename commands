@@ -1,9 +1,497 @@
-& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" .\ATHENA_Scripts\*.py -o pipeline_calls.svg
+"""
+pipeline_analyzer_v2.py
 
-$env:Path += ";$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts"
-code2flow .\ATHENA_Scripts\*.py -o pipeline_calls.svg
+Walks a folder of numbered Python pipeline scripts (1_*.py, 2_*.py, ...) and
+produces a markdown overview with:
+  * A summary table of all scripts
+  * A Mermaid flowchart of inferred data hand-offs (renders in VS Code, GitHub, etc.)
+  * Per-script detail: docstring, libraries, files read/written, functions
 
-& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" (Get-ChildItem .\ATHENA_Scripts\*.py).FullName -o pipeline_calls.svg
+v2 improvements over v1:
+  * Resolves simple path constants (e.g. INPUT_DIR = '../data/inputs/')
+  * Handles f-string paths (e.g. f'{INPUT_DIR}foo.csv')
+  * Recognizes geopandas (gpd.read_file / to_file) and other common patterns
+  * Optionally parses a pipeline_config.json sitting alongside the scripts
+  * Emits a Mermaid diagram block for a real visual workflow
+
+Usage:
+    python pipeline_analyzer_v2.py /path/to/pipeline_folder
+    python pipeline_analyzer_v2.py /path/to/pipeline_folder -o overview.md
+    python pipeline_analyzer_v2.py /path/to/pipeline_folder --config pipeline_config.json
+"""
+
+import argparse
+import ast
+import json
+import re
+from pathlib import Path
+from typing import Optional
 
 
-& "$env:USERPROFILE\miniforge3\envs\j_python3.11\Scripts\code2flow.exe" (Get-ChildItem .\ATHENA_Scripts\*.py).FullName -o pipeline_calls.svg
+# Pandas / geopandas / generic read & write method names we should treat as I/O.
+READ_FUNCS = {
+    "read_csv", "read_excel", "read_parquet", "read_json", "read_pickle",
+    "read_feather", "read_html", "read_sql", "read_table", "read_file",
+    "load", "loads", "load_workbook", "imread",
+}
+WRITE_FUNCS = {
+    "to_csv", "to_excel", "to_parquet", "to_json", "to_pickle", "to_feather",
+    "to_sql", "to_html", "to_file", "dump", "dumps", "save", "savefig",
+    "imwrite", "write", "writelines",
+}
+
+
+class ScriptInfo:
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+        self.docstring: Optional[str] = None
+        self.imports: list[str] = []
+        self.local_imports: list[str] = []
+        self.functions: list[dict] = []
+        self.classes: list[dict] = []
+        self.files_read: list[str] = []
+        self.files_written: list[str] = []
+        self.cli_args: list[str] = []
+        self.has_main_block: bool = False
+        self.entry_calls: list[str] = []
+        self.line_count: int = 0
+        self.constants: dict[str, str] = {}   # var_name -> resolved string value
+
+
+# ---------- AST helpers ----------
+
+def get_arg_name(arg_node) -> str:
+    name = arg_node.arg
+    annotation = ""
+    if arg_node.annotation is not None:
+        try:
+            annotation = f": {ast.unparse(arg_node.annotation)}"
+        except Exception:
+            annotation = ""
+    return f"{name}{annotation}"
+
+
+def resolve_string(node, constants: dict[str, str]) -> Optional[str]:
+    """
+    Try to resolve a node to a string. Handles:
+      - plain string literals: 'foo.csv'
+      - variable references that were assigned a string: PATH (if PATH='...')
+      - f-strings that mix constants and literals: f'{PATH}foo.csv'
+      - string concatenation with '+'
+    Returns None if it can't be resolved.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+
+    if isinstance(node, ast.JoinedStr):  # f-string
+        pieces = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                pieces.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                inner = resolve_string(value.value, constants)
+                if inner is None:
+                    return None
+                pieces.append(inner)
+            else:
+                return None
+        return "".join(pieces)
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = resolve_string(node.left, constants)
+        right = resolve_string(node.right, constants)
+        if left is not None and right is not None:
+            return left + right
+        return None
+
+    return None
+
+
+def looks_like_path(s: str) -> bool:
+    if not s or len(s) > 300:
+        return False
+    if "/" in s or "\\" in s:
+        return True
+    return bool(re.search(r"\.\w{1,6}$", s))
+
+
+def collect_constants(tree: ast.AST, config_constants: dict) -> dict[str, str]:
+    """
+    Walk top-level (module body) assignments and collect simple string-valued names.
+    Handles single assignments like INPUT_PATH = '../data/inputs/' that show up at
+    the top of pipeline scripts.
+
+    config_constants comes from pipeline_config.json (if provided) and is merged in
+    so paths defined there can be resolved too.
+    """
+    constants = dict(config_constants)
+
+    if not isinstance(tree, ast.Module):
+        return constants
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            value = resolve_string(node.value, constants)
+            if value is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = value
+    return constants
+
+
+def collect_path_arg(call_node, constants: dict[str, str]) -> Optional[str]:
+    """Try to extract the path argument from a function call (first positional or
+    common keyword like path/filepath/filename)."""
+    if call_node.args:
+        candidate = resolve_string(call_node.args[0], constants)
+        if candidate and looks_like_path(candidate):
+            return candidate
+
+    for kw in call_node.keywords:
+        if kw.arg in {"path", "filepath", "filename", "file", "io", "buf"}:
+            candidate = resolve_string(kw.value, constants)
+            if candidate and looks_like_path(candidate):
+                return candidate
+    return None
+
+
+# ---------- Script analysis ----------
+
+def analyze_script(path: Path, sibling_module_names: set[str], config_constants: dict) -> ScriptInfo:
+    info = ScriptInfo(path)
+    source = path.read_text(encoding="utf-8", errors="replace")
+    info.line_count = source.count("\n") + 1
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as e:
+        info.docstring = f"(could not parse: {e})"
+        return info
+
+    info.docstring = ast.get_docstring(tree)
+    info.constants = collect_constants(tree, config_constants)
+
+    for node in ast.walk(tree):
+        # Imports
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in sibling_module_names:
+                    info.local_imports.append(alias.name)
+                else:
+                    info.imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            top = module.split(".")[0]
+            if top in sibling_module_names or node.level > 0:
+                info.local_imports.append(module or "(relative)")
+            else:
+                info.imports.append(module)
+
+        # Calls: argparse, reads, writes, open()
+        elif isinstance(node, ast.Call):
+            func = node.func
+            attr = func.attr if isinstance(func, ast.Attribute) else None
+
+            if attr == "add_argument":
+                if node.args:
+                    arg_name = resolve_string(node.args[0], info.constants)
+                    if arg_name:
+                        info.cli_args.append(arg_name)
+
+            if attr in READ_FUNCS:
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    info.files_read.append(resolved)
+            elif attr in WRITE_FUNCS:
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    info.files_written.append(resolved)
+
+            if isinstance(func, ast.Name) and func.id == "open":
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    mode = "r"
+                    if len(node.args) > 1:
+                        m = resolve_string(node.args[1], info.constants)
+                        if m:
+                            mode = m
+                    for kw in node.keywords:
+                        if kw.arg == "mode":
+                            m = resolve_string(kw.value, info.constants)
+                            if m:
+                                mode = m
+                    if any(c in mode for c in "wax"):
+                        info.files_written.append(resolved)
+                    else:
+                        info.files_read.append(resolved)
+
+    # Top-level structure
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info.functions.append({
+                "name": node.name,
+                "args": [get_arg_name(a) for a in node.args.args],
+                "docstring": ast.get_docstring(node),
+                "lineno": node.lineno,
+            })
+        elif isinstance(node, ast.ClassDef):
+            methods = [
+                n.name for n in node.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            info.classes.append({
+                "name": node.name,
+                "methods": methods,
+                "docstring": ast.get_docstring(node),
+            })
+        elif isinstance(node, ast.If):
+            test = node.test
+            if (isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == "__name__"):
+                info.has_main_block = True
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            if isinstance(call.func, ast.Name):
+                info.entry_calls.append(call.func.id)
+            elif isinstance(call.func, ast.Attribute):
+                info.entry_calls.append(call.func.attr)
+
+    def dedupe(seq):
+        seen = set()
+        return [x for x in seq if not (x in seen or seen.add(x))]
+
+    info.imports = dedupe(info.imports)
+    info.local_imports = dedupe(info.local_imports)
+    info.files_read = dedupe(info.files_read)
+    info.files_written = dedupe(info.files_written)
+    info.cli_args = dedupe(info.cli_args)
+    info.entry_calls = dedupe(info.entry_calls)
+    return info
+
+
+# ---------- Mermaid diagram ----------
+
+def safe_node_id(name: str) -> str:
+    """Mermaid node IDs must be alphanumeric-ish."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
+def build_mermaid(scripts: list[ScriptInfo]) -> str:
+    """Build a top-down Mermaid flowchart.
+
+    Each script becomes a node. Files that flow between scripts become edges
+    labeled with the filename. Files only read (never written by a script) are
+    drawn as 'external input' nodes. Files only written are 'external output'
+    nodes.
+    """
+    lines = ["```mermaid", "flowchart TD"]
+    writers: dict[str, str] = {}   # filename -> script that writes it
+    for s in scripts:
+        for f in s.files_written:
+            writers[Path(f).name] = s.name
+
+    # Declare script nodes
+    for s in scripts:
+        node_id = safe_node_id(s.name)
+        label = s.name.replace(".py", "")
+        lines.append(f'    {node_id}["📄 {label}"]')
+
+    # External inputs and outputs
+    external_inputs: dict[str, str] = {}   # filename -> node id
+    external_outputs: dict[str, str] = {}
+
+    edges = []  # (from, to, label)
+    for s in scripts:
+        s_id = safe_node_id(s.name)
+        for f in s.files_read:
+            base = Path(f).name
+            if base in writers and writers[base] != s.name:
+                edges.append((safe_node_id(writers[base]), s_id, base))
+            else:
+                ext_id = "IN_" + safe_node_id(base)
+                external_inputs[base] = ext_id
+                edges.append((ext_id, s_id, base))
+        for f in s.files_written:
+            base = Path(f).name
+            consumers = [
+                other for other in scripts
+                if any(Path(r).name == base for r in other.files_read)
+                and other.name != s.name
+            ]
+            if not consumers:
+                ext_id = "OUT_" + safe_node_id(base)
+                external_outputs[base] = ext_id
+                edges.append((s_id, ext_id, base))
+
+    for base, ext_id in external_inputs.items():
+        lines.append(f'    {ext_id}[("📥 {base}")]')
+    for base, ext_id in external_outputs.items():
+        lines.append(f'    {ext_id}[("📤 {base}")]')
+
+    seen_edges = set()
+    for src, dst, label in edges:
+        key = (src, dst, label)
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        safe_label = label.replace('"', '\\"')
+        lines.append(f'    {src} -->|"{safe_label}"| {dst}')
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ---------- Markdown rendering ----------
+
+def render_markdown(scripts: list[ScriptInfo], folder: Path, config_used: Optional[Path]) -> str:
+    lines = []
+    lines.append(f"# Pipeline Overview: `{folder.name}`\n")
+    lines.append(f"_{len(scripts)} scripts analyzed_")
+    if config_used:
+        lines.append(f"_Config loaded from `{config_used.name}`_")
+    lines.append("")
+
+    # Mermaid flowchart up top
+    lines.append("## Workflow Diagram\n")
+    lines.append(
+        "Boxes = scripts. Rounded boxes = files. Arrows show which file flows "
+        "from one script to another.\n"
+    )
+    lines.append(build_mermaid(scripts))
+    lines.append("")
+
+    # Glance table
+    lines.append("## Pipeline at a glance\n")
+    lines.append("| # | Script | Purpose | Reads | Writes |")
+    lines.append("|---|--------|---------|-------|--------|")
+    for s in scripts:
+        purpose = (s.docstring or "").strip().split("\n")[0][:80] or "_(no docstring)_"
+        reads = ", ".join(Path(f).name for f in s.files_read) or "—"
+        writes = ", ".join(Path(f).name for f in s.files_written) or "—"
+        num = s.name.split("_")[0]
+        lines.append(f"| {num} | `{s.name}` | {purpose} | {reads} | {writes} |")
+    lines.append("")
+
+    # Per-script detail
+    lines.append("## Script-by-script detail\n")
+    for s in scripts:
+        lines.append(f"### `{s.name}` ({s.line_count} lines)\n")
+        if s.docstring:
+            lines.append(f"> {s.docstring.strip()}\n")
+        else:
+            lines.append("> _No module docstring._\n")
+
+        if s.imports:
+            lines.append(f"**External libraries:** {', '.join(f'`{i}`' for i in s.imports)}\n")
+        if s.local_imports:
+            lines.append(f"**Imports from siblings:** {', '.join(f'`{i}`' for i in s.local_imports)}\n")
+
+        if s.cli_args:
+            lines.append(f"**CLI arguments:** {', '.join(f'`{a}`' for a in s.cli_args)}\n")
+
+        if s.files_read:
+            lines.append("**Reads:**")
+            for f in s.files_read:
+                lines.append(f"- `{f}`")
+            lines.append("")
+        if s.files_written:
+            lines.append("**Writes:**")
+            for f in s.files_written:
+                lines.append(f"- `{f}`")
+            lines.append("")
+
+        if s.functions:
+            lines.append("**Functions defined:**")
+            for fn in s.functions:
+                sig = f"`{fn['name']}({', '.join(fn['args'])})`"
+                doc = fn["docstring"].strip().split("\n")[0] if fn["docstring"] else ""
+                lines.append(f"- {sig} — {doc}" if doc else f"- {sig}")
+            lines.append("")
+
+        if s.classes:
+            lines.append("**Classes defined:**")
+            for c in s.classes:
+                methods = ", ".join(c["methods"]) or "_no methods_"
+                lines.append(f"- `{c['name']}` — methods: {methods}")
+            lines.append("")
+
+        if s.has_main_block:
+            lines.append("**Has `if __name__ == \"__main__\":` block** — runnable as a script.\n")
+        elif s.entry_calls:
+            lines.append(f"**Top-level calls:** {', '.join(f'`{c}()`' for c in s.entry_calls)}\n")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
+# ---------- Config loading ----------
+
+def load_config_constants(config_path: Path) -> dict[str, str]:
+    """Flatten a JSON config into a dict of string -> string for constant resolution.
+    Keys at any depth become available as constants; non-string values are ignored."""
+    constants: dict[str, str] = {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return constants
+
+    def walk(prefix: str, obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(k, v)  # use the leaf key only, since that's how scripts likely reference it
+        elif isinstance(obj, str):
+            if prefix:
+                constants[prefix] = obj
+
+    walk("", data)
+    return constants
+
+
+# ---------- Main ----------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("folder", help="Path to folder containing pipeline .py files")
+    parser.add_argument("-o", "--output", default="pipeline_overview.md",
+                        help="Output markdown file (default: pipeline_overview.md)")
+    parser.add_argument("--config", default=None,
+                        help="Optional JSON config file whose string values "
+                             "should be available as constants during analysis")
+    args = parser.parse_args()
+
+    folder = Path(args.folder).resolve()
+    if not folder.is_dir():
+        raise SystemExit(f"Not a directory: {folder}")
+
+    config_constants: dict[str, str] = {}
+    config_path: Optional[Path] = None
+    if args.config:
+        config_path = Path(args.config).resolve()
+        if config_path.is_file():
+            config_constants = load_config_constants(config_path)
+
+    py_files = sorted(folder.glob("*.py"))
+    py_files = [p for p in py_files if p.name != Path(__file__).name]
+    if not py_files:
+        raise SystemExit(f"No .py files found in {folder}")
+
+    sibling_names = {p.stem for p in py_files}
+    scripts = [analyze_script(p, sibling_names, config_constants) for p in py_files]
+
+    output = render_markdown(scripts, folder, config_path)
+    out_path = Path(args.output).resolve()
+    out_path.write_text(output, encoding="utf-8")
+    print(f"Wrote {out_path}")
+    print(f"Analyzed {len(scripts)} script(s).")
+
+
+if __name__ == "__main__":
+    main()
