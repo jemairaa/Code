@@ -1,1 +1,596 @@
-python pipeline_analyzer_v3.py .\ATHENA_Scripts --config .\ATHENA_Scripts\pipeline_config.json -o pipeline_overview_v3.md
+"""
+pipeline_analyzer_v6.py
+
+An INPUT-CENTRIC view of a numbered Python pipeline, built to help a team decide
+which input data files to prioritize.
+
+v6 builds on v5 with two refinements the team asked for:
+
+  1. TWO-LAYER VIEW. Instead of one diagram, v6 produces two:
+       * Diagram A - DIRECT reads: which scripts read each input directly.
+       * Diagram B - DOWNSTREAM REACH: every script an input ultimately
+         influences, including indirectly (a script reading a file produced by
+         another script that read the input). This is the input's "blast
+         radius" - if the input is wrong, how much of the pipeline is affected.
+
+  2. TEAM-DEFINED PRIORITY LABELS. v5 special-cased high/medium/low. v6 makes no
+     assumption: it detects whatever distinct priority labels the team actually
+     used in input_priorities.json and assigns each one its own color
+     automatically.
+
+Workflow (unchanged from v5):
+    # first run - discovers inputs, writes a blank priorities template
+    python pipeline_analyzer_v6.py .\\ATHENA_Scripts -o input_overview.md
+
+    # team edits input_priorities.json - any labels they like
+
+    # second run - both diagrams reflect the team's ranking
+    python pipeline_analyzer_v6.py .\\ATHENA_Scripts -o input_overview.md \\
+        --priorities input_priorities.json
+
+Definitions:
+  * External input  = a file some script reads that NO script in the folder
+    writes. These are what the team prioritizes.
+  * Intermediate file = written by one script, read by another. Not an input.
+  * Direct reach    = scripts that read the input file themselves.
+  * Downstream reach = direct readers PLUS every script transitively downstream
+    of them via intermediate files.
+"""
+
+import argparse
+import ast
+import json
+import re
+from pathlib import Path
+from typing import Optional
+
+
+READ_FUNCS = {
+    "read_csv", "read_excel", "read_parquet", "read_json", "read_pickle",
+    "read_feather", "read_html", "read_sql", "read_table", "read_file",
+    "load", "loads", "load_workbook", "imread",
+}
+WRITE_FUNCS = {
+    "to_csv", "to_excel", "to_parquet", "to_json", "to_pickle", "to_feather",
+    "to_sql", "to_html", "to_file", "dump", "dumps", "save", "savefig",
+    "imwrite", "write", "writelines",
+}
+
+
+class ScriptInfo:
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+        self.files_read: list[str] = []
+        self.files_written: list[str] = []
+        self.constants: dict[str, str] = {}
+        self.line_count: int = 0
+
+
+# ---------- AST path-resolution engine (shared with v2-v5) ----------
+
+def resolve_string(node, constants: dict[str, str]) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.JoinedStr):
+        pieces = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                pieces.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                inner = resolve_string(value.value, constants)
+                if inner is None:
+                    return None
+                pieces.append(inner)
+            else:
+                return None
+        return "".join(pieces)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = resolve_string(node.left, constants)
+        right = resolve_string(node.right, constants)
+        if left is not None and right is not None:
+            return left + right
+        return None
+    return None
+
+
+def looks_like_path(s: str) -> bool:
+    if not s or len(s) > 300:
+        return False
+    if "/" in s or "\\" in s:
+        return True
+    return bool(re.search(r"\.\w{1,6}$", s))
+
+
+def collect_constants(tree: ast.AST) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    if not isinstance(tree, ast.Module):
+        return constants
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            value = resolve_string(node.value, constants)
+            if value is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = value
+    return constants
+
+
+def collect_path_arg(call_node, constants: dict[str, str]) -> Optional[str]:
+    if call_node.args:
+        candidate = resolve_string(call_node.args[0], constants)
+        if candidate and looks_like_path(candidate):
+            return candidate
+    for kw in call_node.keywords:
+        if kw.arg in {"path", "filepath", "filename", "file", "io", "buf"}:
+            candidate = resolve_string(kw.value, constants)
+            if candidate and looks_like_path(candidate):
+                return candidate
+    return None
+
+
+def analyze_script(path: Path) -> ScriptInfo:
+    info = ScriptInfo(path)
+    source = path.read_text(encoding="utf-8", errors="replace")
+    info.line_count = source.count("\n") + 1
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
+        return info
+
+    info.constants = collect_constants(tree)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            attr = func.attr if isinstance(func, ast.Attribute) else None
+            if attr in READ_FUNCS:
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    info.files_read.append(resolved)
+            elif attr in WRITE_FUNCS:
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    info.files_written.append(resolved)
+            if isinstance(func, ast.Name) and func.id == "open":
+                resolved = collect_path_arg(node, info.constants)
+                if resolved:
+                    mode = "r"
+                    if len(node.args) > 1:
+                        m = resolve_string(node.args[1], info.constants)
+                        if m:
+                            mode = m
+                    for kw in node.keywords:
+                        if kw.arg == "mode":
+                            m = resolve_string(kw.value, info.constants)
+                            if m:
+                                mode = m
+                    if any(c in mode for c in "wax"):
+                        info.files_written.append(resolved)
+                    else:
+                        info.files_read.append(resolved)
+
+    def dedupe(seq):
+        seen = set()
+        return [x for x in seq if not (x in seen or seen.add(x))]
+
+    info.files_read = dedupe(info.files_read)
+    info.files_written = dedupe(info.files_written)
+    return info
+
+
+# ---------- Input discovery + reach computation ----------
+
+class InputFile:
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.full_paths: list[str] = []
+        self.direct_consumers: list[str] = []     # scripts that read it directly
+        self.downstream_reach: list[str] = []     # direct + transitive
+        self.priority: str = ""
+        self.note: str = ""
+
+
+def discover_inputs(scripts: list[ScriptInfo]) -> dict[str, InputFile]:
+    """External input = read by some script, written by none."""
+    written_basenames = set()
+    for s in scripts:
+        for f in s.files_written:
+            written_basenames.add(Path(f).name)
+
+    inputs: dict[str, InputFile] = {}
+    for s in scripts:
+        for f in s.files_read:
+            base = Path(f).name
+            if base in written_basenames:
+                continue
+            if base not in inputs:
+                inputs[base] = InputFile(base)
+            if f not in inputs[base].full_paths:
+                inputs[base].full_paths.append(f)
+            if s.name not in inputs[base].direct_consumers:
+                inputs[base].direct_consumers.append(s.name)
+    return inputs
+
+
+def build_script_dependency_graph(scripts: list[ScriptInfo]) -> dict[str, set[str]]:
+    """
+    Returns {script_name: set of script_names that directly depend on it}.
+    Script B depends on script A if B reads a file A writes.
+    """
+    writers: dict[str, str] = {}  # intermediate filename -> producing script
+    for s in scripts:
+        for f in s.files_written:
+            writers[Path(f).name] = s.name
+
+    downstream: dict[str, set[str]] = {s.name: set() for s in scripts}
+    for s in scripts:
+        for f in s.files_read:
+            base = Path(f).name
+            producer = writers.get(base)
+            if producer and producer != s.name:
+                downstream[producer].add(s.name)
+    return downstream
+
+
+def compute_downstream_reach(inputs: dict[str, InputFile],
+                             downstream: dict[str, set[str]]) -> None:
+    """
+    For each input, walk the script dependency graph from its direct consumers
+    to find every script transitively influenced. Sets .downstream_reach.
+    """
+    def reach_from(start_scripts: list[str]) -> list[str]:
+        seen: set[str] = set()
+        stack = list(start_scripts)
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for nxt in downstream.get(current, ()):
+                if nxt not in seen:
+                    stack.append(nxt)
+        return sorted(seen)
+
+    for inp in inputs.values():
+        inp.downstream_reach = reach_from(inp.direct_consumers)
+
+
+# ---------- Priorities file (team-driven) ----------
+
+def write_priorities_template(inputs: dict[str, InputFile], path: Path) -> None:
+    if path.exists():
+        return
+    template = {
+        "_instructions": (
+            "Set 'priority' for each input. Use ANY labels your team likes "
+            "(high/medium/low, P0/P1/P2, critical/standard, etc.) - the "
+            "analyzer auto-detects whatever labels you use and colors them. "
+            "'note' is optional free text. Re-run with --priorities pointing "
+            "at this file to update both diagrams."
+        ),
+        "inputs": {
+            name: {"priority": "", "note": ""}
+            for name in sorted(inputs.keys())
+        },
+    }
+    path.write_text(json.dumps(template, indent=2), encoding="utf-8")
+
+
+def load_priorities(path: Path, inputs: dict[str, InputFile]) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    entries = data.get("inputs", {})
+    for name, meta in entries.items():
+        if name in inputs and isinstance(meta, dict):
+            inputs[name].priority = str(meta.get("priority", "") or "")
+            inputs[name].note = str(meta.get("note", "") or "")
+    return True
+
+
+# ---------- Auto color assignment for team-defined labels ----------
+
+# A palette of distinct, readable Mermaid styles. Assigned to whatever distinct
+# priority labels the team used, in order of first appearance.
+COLOR_PALETTE = [
+    "fill:#ffcdd2,stroke:#b71c1c,color:#7f0000,stroke-width:4px",   # red
+    "fill:#fff9c4,stroke:#f9a825,color:#5f4300,stroke-width:3px",   # amber
+    "fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20,stroke-width:2px",   # green
+    "fill:#bbdefb,stroke:#1565c0,color:#0d47a1,stroke-width:2px",   # blue
+    "fill:#e1bee7,stroke:#7b1fa2,color:#4a148c,stroke-width:2px",   # purple
+    "fill:#ffe0b2,stroke:#ef6c00,color:#e65100,stroke-width:2px",   # orange
+    "fill:#b2dfdb,stroke:#00695c,color:#004d40,stroke-width:2px",   # teal
+    "fill:#f8bbd0,stroke:#ad1457,color:#880e4f,stroke-width:2px",   # pink
+]
+UNSET_STYLE = "fill:#fafafa,stroke:#bdbdbd,color:#9e9e9e,stroke-width:1px,stroke-dasharray:4 3"
+
+
+def assign_priority_styles(inputs: dict[str, InputFile]) -> dict[str, str]:
+    """
+    Detect the distinct priority labels the team used and map each to a Mermaid
+    classDef name. Blank priority -> 'pri_unset'. Returns {label: class_name}.
+
+    If the team used common ordered words, sort those sensibly; otherwise keep
+    first-seen order.
+    """
+    # Collect distinct non-empty labels in first-seen order
+    seen: list[str] = []
+    for name in sorted(inputs.keys()):
+        p = inputs[name].priority.strip()
+        if p and p not in seen:
+            seen.append(p)
+
+    # If labels look like a known ordered scheme, sort them that way so the
+    # "most important" color (red) lands on the most important tier.
+    known_orders = [
+        ["high", "medium", "low"],
+        ["critical", "high", "medium", "low"],
+        ["p0", "p1", "p2", "p3"],
+        ["1", "2", "3", "4", "5"],
+    ]
+    lowered = [s.lower() for s in seen]
+    for order in known_orders:
+        if set(lowered).issubset(set(order)):
+            seen.sort(key=lambda s: order.index(s.lower()))
+            break
+
+    label_to_class: dict[str, str] = {}
+    for idx, label in enumerate(seen):
+        # class name must be identifier-safe
+        safe = "pri_" + re.sub(r"[^A-Za-z0-9_]", "_", label.lower())
+        label_to_class[label] = safe
+    return label_to_class
+
+
+def class_for(priority: str, label_to_class: dict[str, str]) -> str:
+    p = priority.strip()
+    if not p:
+        return "pri_unset"
+    return label_to_class.get(p, "pri_unset")
+
+
+def emit_classdefs(label_to_class: dict[str, str]) -> list[str]:
+    lines = []
+    palette_idx = 0
+    for label, class_name in label_to_class.items():
+        style = COLOR_PALETTE[palette_idx % len(COLOR_PALETTE)]
+        palette_idx += 1
+        lines.append(f"    classDef {class_name} {style}")
+    lines.append(f"    classDef pri_unset {UNSET_STYLE}")
+    return lines
+
+
+# ---------- Mermaid diagrams ----------
+
+def safe_node_id(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
+def sort_inputs(inputs: dict[str, InputFile], label_to_class: dict[str, str]):
+    """Sort inputs so higher-priority (earlier in label_to_class) float to top,
+    then by downstream reach size descending."""
+    label_rank = {label: i for i, label in enumerate(label_to_class.keys())}
+
+    def key(item):
+        name, inp = item
+        rank = label_rank.get(inp.priority.strip(), 999)
+        return (rank, -len(inp.downstream_reach), -len(inp.direct_consumers), name)
+
+    return sorted(inputs.items(), key=key)
+
+
+def build_diagram(inputs: dict[str, InputFile], label_to_class: dict[str, str],
+                  mode: str) -> str:
+    """
+    mode = 'direct'      -> arrows to scripts that read the input directly
+    mode = 'downstream'  -> arrows to every script in the input's reach
+    """
+    lines = ["```mermaid", "flowchart LR"]
+    sorted_inputs = sort_inputs(inputs, label_to_class)
+
+    # Input nodes
+    lines.append('    subgraph INPUTS["📥 External Input Files"]')
+    for name, inp in sorted_inputs:
+        node_id = "IN_" + safe_node_id(name)
+        pri_label = inp.priority.strip() or "unranked"
+        if mode == "direct":
+            count = len(inp.direct_consumers)
+            metric = f"{count} script{'s' if count != 1 else ''} read this directly"
+        else:
+            count = len(inp.downstream_reach)
+            metric = f"reaches {count} script{'s' if count != 1 else ''} total"
+        lines.append(
+            f'        {node_id}["<b>{name}</b><br/>'
+            f'priority: {pri_label}<br/>{metric}"]'
+        )
+    lines.append("    end")
+
+    # Script nodes - only those involved in this mode
+    if mode == "direct":
+        involved = sorted({c for inp in inputs.values() for c in inp.direct_consumers})
+    else:
+        involved = sorted({c for inp in inputs.values() for c in inp.downstream_reach})
+
+    lines.append('    subgraph SCRIPTS["📄 Scripts"]')
+    for sname in involved:
+        node_id = safe_node_id(sname)
+        disp = sname.replace(".py", "")
+        lines.append(f'        {node_id}["{disp}"]')
+    lines.append("    end")
+
+    # Edges
+    for name, inp in sorted_inputs:
+        in_id = "IN_" + safe_node_id(name)
+        targets = inp.direct_consumers if mode == "direct" else inp.downstream_reach
+        direct_set = set(inp.direct_consumers)
+        for sname in targets:
+            if mode == "downstream" and sname not in direct_set:
+                # indirect reach - dashed/dotted arrow
+                lines.append(f"    {in_id} -.-> {safe_node_id(sname)}")
+            else:
+                lines.append(f"    {in_id} --> {safe_node_id(sname)}")
+
+    # Priority styling
+    lines.extend(emit_classdefs(label_to_class))
+    for name, inp in sorted_inputs:
+        in_id = "IN_" + safe_node_id(name)
+        lines.append(f"    class {in_id} {class_for(inp.priority, label_to_class)}")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ---------- Markdown rendering ----------
+
+def render_markdown(inputs: dict[str, InputFile], scripts: list[ScriptInfo],
+                    folder: Path, priorities_loaded: bool,
+                    priorities_path: Path) -> str:
+    label_to_class = assign_priority_styles(inputs)
+    sorted_inputs = sort_inputs(inputs, label_to_class)
+
+    lines = []
+    lines.append(f"# Input-Centric Pipeline View: `{folder.name}`\n")
+    lines.append(f"_{len(inputs)} external input files · {len(scripts)} scripts_\n")
+
+    if priorities_loaded:
+        ranked = sum(1 for i in inputs.values() if i.priority.strip())
+        labels_used = ", ".join(f"`{l}`" for l in label_to_class.keys()) or "_none_"
+        lines.append(
+            f"> ✅ Team priorities loaded from `{priorities_path.name}` — "
+            f"{ranked} of {len(inputs)} inputs ranked. Labels in use: {labels_used}\n"
+        )
+    else:
+        lines.append(
+            f"> 📝 A priorities template has been written to "
+            f"`{priorities_path.name}`. Have the team fill in the `priority` "
+            f"field (any labels they like), then re-run with "
+            f"`--priorities {priorities_path.name}`.\n"
+        )
+
+    # Diagram A - direct
+    lines.append("## Diagram A — Direct Reads\n")
+    lines.append(
+        "Which scripts read each input **directly**. This is the immediate "
+        "dependency picture.\n"
+    )
+    lines.append(build_diagram(inputs, label_to_class, mode="direct"))
+    lines.append("")
+
+    # Diagram B - downstream reach
+    lines.append("## Diagram B — Downstream Reach\n")
+    lines.append(
+        "Every script each input **ultimately influences** — direct readers "
+        "(solid arrows) plus scripts downstream of them via intermediate files "
+        "(dashed arrows). This is the input's blast radius: if the input is "
+        "wrong, this is how much of the pipeline is affected.\n"
+    )
+    lines.append(build_diagram(inputs, label_to_class, mode="downstream"))
+    lines.append("")
+
+    # Inventory table
+    lines.append("## Input Inventory\n")
+    lines.append("| Input File | Priority | Direct Reads | Total Reach | Reach (scripts) | Note |")
+    lines.append("|------------|----------|--------------|-------------|-----------------|------|")
+    for name, inp in sorted_inputs:
+        pri = inp.priority.strip() or "_unranked_"
+        direct = len(inp.direct_consumers)
+        total = len(inp.downstream_reach)
+        reach_list = ", ".join(c.replace(".py", "") for c in inp.downstream_reach) or "—"
+        note = inp.note.strip() or ""
+        lines.append(f"| `{name}` | {pri} | {direct} | {total} | {reach_list} | {note} |")
+    lines.append("")
+
+    # Per-input detail
+    lines.append("## Input Detail\n")
+    for name, inp in sorted_inputs:
+        lines.append(f"### `{name}`\n")
+        lines.append(f"- **Priority:** {inp.priority.strip() or '_unranked_'}")
+        if inp.note.strip():
+            lines.append(f"- **Note:** {inp.note.strip()}")
+        lines.append(
+            f"- **Direct readers ({len(inp.direct_consumers)}):** "
+            + (", ".join(f"`{c}`" for c in inp.direct_consumers) or "—")
+        )
+        indirect = [s for s in inp.downstream_reach if s not in set(inp.direct_consumers)]
+        lines.append(
+            f"- **Indirect (downstream) reach ({len(indirect)}):** "
+            + (", ".join(f"`{c}`" for c in indirect) or "—")
+        )
+        lines.append(f"- **Total reach:** {len(inp.downstream_reach)} script(s)")
+        if len(inp.full_paths) > 1:
+            lines.append("- **Paths seen:** " + ", ".join(f"`{p}`" for p in inp.full_paths))
+        elif inp.full_paths:
+            lines.append(f"- **Path:** `{inp.full_paths[0]}`")
+        lines.append("")
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
+# ---------- Main ----------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("folder", help="Path to folder containing pipeline .py files")
+    parser.add_argument("-o", "--output", default="input_overview.md")
+    parser.add_argument("--priorities", default=None,
+                        help="Path to the team's input_priorities.json. If "
+                             "omitted, a template is written next to the output.")
+    args = parser.parse_args()
+
+    folder = Path(args.folder).resolve()
+    if not folder.is_dir():
+        raise SystemExit(f"Not a directory: {folder}")
+
+    py_files = sorted(folder.glob("*.py"))
+    py_files = [p for p in py_files if p.name != Path(__file__).name]
+    if not py_files:
+        raise SystemExit(f"No .py files found in {folder}")
+
+    scripts = [analyze_script(p) for p in py_files]
+    inputs = discover_inputs(scripts)
+
+    if not inputs:
+        raise SystemExit(
+            "No external input files detected. Either the scripts build their "
+            "paths in a way the analyzer can't resolve yet, or every file read "
+            "is produced by another script in the folder."
+        )
+
+    # Compute downstream reach
+    downstream = build_script_dependency_graph(scripts)
+    compute_downstream_reach(inputs, downstream)
+
+    # Priorities file location
+    if args.priorities:
+        priorities_path = Path(args.priorities).resolve()
+    else:
+        priorities_path = Path(args.output).resolve().parent / "input_priorities.json"
+
+    priorities_loaded = False
+    if priorities_path.exists():
+        priorities_loaded = load_priorities(priorities_path, inputs)
+    else:
+        write_priorities_template(inputs, priorities_path)
+
+    output = render_markdown(inputs, scripts, folder, priorities_loaded, priorities_path)
+    out_path = Path(args.output).resolve()
+    out_path.write_text(output, encoding="utf-8")
+
+    print(f"Wrote {out_path}")
+    print(f"Found {len(inputs)} external input file(s).")
+    if priorities_loaded:
+        print(f"Loaded team priorities from {priorities_path}")
+    else:
+        print(f"Wrote priorities template to {priorities_path}")
+        print("Have the team fill it in, then re-run with --priorities "
+              f"{priorities_path.name}")
+
+
+if __name__ == "__main__":
+    main()
