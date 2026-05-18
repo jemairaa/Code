@@ -1,46 +1,57 @@
 """
-pipeline_analyzer_v6.py
+pipeline_analyzer_v7.py
 
-An INPUT-CENTRIC view of a numbered Python pipeline, built to help a team decide
-which input data files to prioritize.
+Produces a DEEP PER-SCRIPT SUMMARY for each script in a numbered Python pipeline,
+in a fixed five-part structure:
 
-v6 builds on v5 with two refinements the team asked for:
+    1. Purpose         - one plain-English sentence (LLM-written if Ollama is up)
+    2. Inputs          - files the script reads
+    3. Outputs         - files the script writes
+    4. Calculations    - the actual math: arithmetic on columns, np.where, trig,
+                         groupby aggregations, unit conversions, .apply()
+    5. Data shaping    - merges, filters, row add/drop, renames, missing-value
+                         handling, reshapes (melt/pivot), formatting
 
-  1. TWO-LAYER VIEW. Instead of one diagram, v6 produces two:
-       * Diagram A - DIRECT reads: which scripts read each input directly.
-       * Diagram B - DOWNSTREAM REACH: every script an input ultimately
-         influences, including indirectly (a script reading a file produced by
-         another script that read the input). This is the input's "blast
-         radius" - if the input is wrong, how much of the pipeline is affected.
+Plus an "open items" box pulled from TODO/FIXME/"need to" comments.
 
-  2. TEAM-DEFINED PRIORITY LABELS. v5 special-cased high/medium/low. v6 makes no
-     assumption: it detects whatever distinct priority labels the team actually
-     used in input_priorities.json and assigns each one its own color
-     automatically.
+DETERMINISTIC CORE + OPTIONAL LOCAL LLM
+  The bulk of every summary is extracted deterministically by parsing the code -
+  no model needed. If a local Ollama server is running, v7 additionally asks it
+  to (a) write the one-sentence Purpose and (b) phrase the calculation and
+  shaping findings as readable prose. If Ollama is NOT running, v7 still produces
+  the full structured summary - it just skips the prose polish. Nothing ever
+  leaves the machine: the only network call is to http://localhost:11434.
 
-Workflow (unchanged from v5):
-    # first run - discovers inputs, writes a blank priorities template
-    python pipeline_analyzer_v6.py .\\ATHENA_Scripts -o input_overview.md
+USAGE
+    # structured summary only, no LLM
+    python pipeline_analyzer_v7.py .\\ATHENA_Scripts -o script_summaries.md
 
-    # team edits input_priorities.json - any labels they like
+    # with local Ollama prose polish (qwen2.5-coder:7b recommended)
+    python pipeline_analyzer_v7.py .\\ATHENA_Scripts -o script_summaries.md --llm
 
-    # second run - both diagrams reflect the team's ranking
-    python pipeline_analyzer_v6.py .\\ATHENA_Scripts -o input_overview.md \\
-        --priorities input_priorities.json
+    # pick a different local model
+    python pipeline_analyzer_v7.py .\\ATHENA_Scripts -o script_summaries.md \\
+        --llm --model qwen2.5-coder:3b
 
-Definitions:
-  * External input  = a file some script reads that NO script in the folder
-    writes. These are what the team prioritizes.
-  * Intermediate file = written by one script, read by another. Not an input.
-  * Direct reach    = scripts that read the input file themselves.
-  * Downstream reach = direct readers PLUS every script transitively downstream
-    of them via intermediate files.
+SETUP FOR THE --llm OPTION
+    1. Install Ollama (https://ollama.com)
+    2. ollama pull qwen2.5-coder:7b
+    3. Make sure `ollama serve` is running (the desktop app does this for you)
+    4. Run v7 with --llm
+
+LLM results are cached in `.summary_cache.json` next to the output, keyed by a
+hash of each script's contents, so re-runs only call the model for changed files.
 """
 
 import argparse
 import ast
+import hashlib
+import io
 import json
 import re
+import tokenize
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional
 
@@ -56,18 +67,62 @@ WRITE_FUNCS = {
     "imwrite", "write", "writelines",
 }
 
+# Data-shaping method names with friendly labels.
+SHAPING_LABELS = {
+    "merge": "merge/join", "join": "merge/join", "merge_asof": "merge/join",
+    "concat": "concatenate (append rows/columns)",
+    "rename": "rename columns", "drop": "drop columns/rows",
+    "drop_duplicates": "drop duplicate rows", "dropna": "drop missing rows",
+    "fillna": "fill missing values", "melt": "reshape: wide -> long (melt)",
+    "pivot": "reshape: long -> wide (pivot)",
+    "pivot_table": "reshape: pivot table", "sort_values": "sort rows",
+    "reset_index": "reset index", "set_index": "set index",
+    "groupby": "group-by aggregation", "isna": "missing-value filtering",
+    "notna": "missing-value filtering", "isnull": "missing-value filtering",
+    "notnull": "missing-value filtering", "isin": "membership filtering",
+    "astype": "type conversion", "unique": "distinct values",
+    "nunique": "count distinct",
+}
+
+# Known numeric constants worth explaining in calculations.
+KNOWN_CONSTANTS = {
+    "0.092903": "square feet -> square meters conversion",
+    "10.7639": "square meters -> square feet conversion",
+    "3.28084": "meters -> feet conversion",
+    "0.3048": "feet -> meters conversion",
+    "1609.34": "miles -> meters conversion",
+    "1.60934": "miles -> kilometers conversion",
+    "0.000621371": "meters -> miles conversion",
+    "3.78541": "US gallons -> liters conversion",
+    "0.264172": "liters -> US gallons conversion",
+}
+
 
 class ScriptInfo:
     def __init__(self, path: Path):
         self.path = path
         self.name = path.name
+        self.source = ""
+        self.line_count = 0
+        self.docstring: Optional[str] = None
+        self.constants: dict[str, str] = {}
+        self.imports: list[str] = []
         self.files_read: list[str] = []
         self.files_written: list[str] = []
-        self.constants: dict[str, str] = {}
-        self.line_count: int = 0
+        self.functions: list[dict] = []
+        self.section_comments: list[str] = []
+        self.todos: list[str] = []
+        # five-part content
+        self.calculations: list[str] = []      # detected math, plain descriptions
+        self.shaping: dict[str, int] = {}      # label -> count
+        self.merges: list[str] = []            # human-readable merge descriptions
+        # filled by LLM pass (optional)
+        self.llm_purpose: str = ""
+        self.llm_calc_prose: str = ""
+        self.llm_shaping_prose: str = ""
 
 
-# ---------- AST path-resolution engine (shared with v2-v5) ----------
+# ---------- AST path-resolution engine (shared with v2-v6) ----------
 
 def resolve_string(node, constants: dict[str, str]) -> Optional[str]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -132,19 +187,231 @@ def collect_path_arg(call_node, constants: dict[str, str]) -> Optional[str]:
     return None
 
 
+# ---------- Section comments + TODOs ----------
+
+def extract_comments(source: str) -> tuple[list[str], list[str]]:
+    comments: list[str] = []
+    todos: list[str] = []
+    todo_pattern = re.compile(r"\b(todo|fixme|hack|xxx|need to|figure out|not yet)\b", re.I)
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for tok in tokens:
+            if tok.type == tokenize.COMMENT:
+                start_col = tok.start[1]
+                text = tok.string.lstrip("#").strip()
+                if not text:
+                    continue
+                if todo_pattern.search(text):
+                    todos.append(text)
+                    continue
+                if re.match(r"^[A-Za-z_][\w\.]*\s*[=\(\[]", text):
+                    continue
+                if re.match(r"^(import|from|def|class|return|if|for|while|print)\b", text):
+                    continue
+                if len(text) > 90:
+                    continue
+                if start_col <= 8:
+                    comments.append(text)
+    except (tokenize.TokenError, IndentationError):
+        pass
+    return comments, todos
+
+
+# ---------- Merge description ----------
+
+def describe_merge(call_node, constants: dict[str, str]) -> Optional[str]:
+    func = call_node.func
+    attr = func.attr if isinstance(func, ast.Attribute) else None
+    if attr not in {"merge", "join", "merge_asof"}:
+        return None
+    left = ""
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        left = func.value.id
+    right = ""
+    if call_node.args and isinstance(call_node.args[0], ast.Name):
+        right = call_node.args[0].id
+    on = None
+    how = None
+    for kw in call_node.keywords:
+        if kw.arg in {"on", "left_on", "right_on"} and isinstance(kw.value, ast.Constant):
+            on = kw.value.value
+        if kw.arg == "how" and isinstance(kw.value, ast.Constant):
+            how = kw.value.value
+    parts = []
+    if left and right:
+        parts.append(f"`{left}` + `{right}`")
+    elif right:
+        parts.append(f"join with `{right}`")
+    if on:
+        parts.append(f"on `{on}`")
+    if how:
+        parts.append(f"({how})")
+    return " ".join(parts) if parts else None
+
+
+# ---------- Calculation detection ----------
+
+def _unparse(node) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return "<expr>"
+
+
+def _column_name(node) -> Optional[str]:
+    """If node is df['col'] style subscript, return 'col'."""
+    if isinstance(node, ast.Subscript):
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            return sl.value
+    return None
+
+
+def _numeric_constants_in(node) -> list[str]:
+    found = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            found.append(repr(n.value))
+    return found
+
+
+def detect_calculations(tree: ast.AST) -> list[str]:
+    """
+    Walk the AST and surface mathematical operations in plain language:
+      * arithmetic assigned to a dataframe column
+      * np.where conditional replacement
+      * np.sin / cos / radians (trig)
+      * groupby().sum()/mean()/etc aggregations
+      * .apply() with a function (row-wise calculation)
+      * numeric constants that match known unit conversions
+    """
+    calcs: list[str] = []
+
+    for node in ast.walk(tree):
+        # --- arithmetic assigned to something (esp. a df column) ---
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.BinOp):
+            op = node.value.op
+            op_name = {
+                ast.Add: "+", ast.Sub: "-", ast.Mult: "×",
+                ast.Div: "/", ast.Pow: "^", ast.Mod: "%",
+            }.get(type(op))
+            if op_name is None:
+                continue
+            # only care about numeric-ish arithmetic, skip string concat we can't tell
+            target_desc = ""
+            if node.targets:
+                tgt = node.targets[0]
+                col = _column_name(tgt)
+                if col:
+                    target_desc = f"`{col}` = "
+                elif isinstance(tgt, ast.Name):
+                    target_desc = f"`{tgt.id}` = "
+            expr = _unparse(node.value)
+            if len(expr) > 120:
+                expr = expr[:117] + "..."
+            line = f"computes {target_desc}`{expr}`"
+            # annotate known unit-conversion constants
+            consts = _numeric_constants_in(node.value)
+            is_known_conversion = False
+            for c in consts:
+                key = c.rstrip("0").rstrip(".") if "." in c else c
+                for known, meaning in KNOWN_CONSTANTS.items():
+                    if c == known or key == known.rstrip("0").rstrip("."):
+                        line += f" — {meaning}"
+                        is_known_conversion = True
+                        break
+            # annotate percentage scaling ONLY for a literal fraction 0 < n < 1
+            # (e.g. x * 0.9 -> "scales to 90%"), and only when the constant
+            # isn't already a recognized unit conversion. Plain multipliers
+            # like 80 are NOT percentages and get no annotation.
+            if isinstance(op, ast.Mult) and not is_known_conversion:
+                for side in (node.value.left, node.value.right):
+                    if isinstance(side, ast.Constant) and isinstance(side.value, float):
+                        v = side.value
+                        if 0 < v < 1:
+                            pct = round(v * 100, 4)
+                            reduction = round(100 - pct, 4)
+                            pct_s = f"{pct:g}"
+                            red_s = f"{reduction:g}"
+                            line += (f" — scales to {pct_s}% of the original "
+                                     f"(a {red_s}% reduction)")
+                            break
+            calcs.append(line)
+
+        # --- AugAssign (x += ...) ---
+        elif isinstance(node, ast.AugAssign) and not isinstance(node.value, ast.Constant):
+            op_name = {
+                ast.Add: "+=", ast.Sub: "-=", ast.Mult: "×=", ast.Div: "/=",
+            }.get(type(node.op))
+            if op_name:
+                col = _column_name(node.target)
+                tgt = f"`{col}`" if col else (
+                    f"`{node.target.id}`" if isinstance(node.target, ast.Name) else "value"
+                )
+                calcs.append(f"updates {tgt} with `{op_name} {_unparse(node.value)[:80]}`")
+
+        # --- function calls: np.where, trig, groupby aggs, apply ---
+        elif isinstance(node, ast.Call):
+            func = node.func
+            # np.where
+            if isinstance(func, ast.Attribute) and func.attr == "where":
+                cond = _unparse(node.args[0]) if node.args else ""
+                if len(cond) > 80:
+                    cond = cond[:77] + "..."
+                calcs.append(f"conditional replace via `np.where({cond} ...)`")
+            # trig / radians
+            if isinstance(func, ast.Attribute) and func.attr in {"sin", "cos", "tan", "radians", "degrees"}:
+                calcs.append(f"trigonometric: `{func.attr}(...)`")
+            # groupby aggregation: look for .groupby(...).agg-ish chains
+            if isinstance(func, ast.Attribute) and func.attr in {
+                "sum", "mean", "median", "min", "max", "count", "std", "agg"
+            }:
+                # is the thing it's called on a groupby?
+                inner = func.value
+                chain = _unparse(inner)
+                if "groupby" in chain:
+                    calcs.append(f"aggregation: `{chain}.{func.attr}()`")
+            # .apply with a function argument
+            if isinstance(func, ast.Attribute) and func.attr == "apply":
+                if node.args and isinstance(node.args[0], ast.Name):
+                    calcs.append(f"row/column-wise calculation: `.apply({node.args[0].id})`")
+                elif node.args and isinstance(node.args[0], ast.Lambda):
+                    calcs.append("row/column-wise calculation: `.apply(lambda ...)`")
+            # round()
+            if isinstance(func, ast.Name) and func.id == "round":
+                pass  # too noisy to list every round()
+
+    # dedupe preserving order
+    seen = set()
+    return [c for c in calcs if not (c in seen or seen.add(c))]
+
+
+# ---------- Whole-script analysis ----------
+
 def analyze_script(path: Path) -> ScriptInfo:
     info = ScriptInfo(path)
     source = path.read_text(encoding="utf-8", errors="replace")
+    info.source = source
     info.line_count = source.count("\n") + 1
+    info.section_comments, info.todos = extract_comments(source)
+
     try:
         tree = ast.parse(source, filename=str(path))
-    except SyntaxError:
+    except SyntaxError as e:
+        info.docstring = f"(could not parse: {e})"
         return info
 
+    info.docstring = ast.get_docstring(tree)
     info.constants = collect_constants(tree)
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                info.imports.append(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                info.imports.append(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
             func = node.func
             attr = func.attr if isinstance(func, ast.Attribute) else None
             if attr in READ_FUNCS:
@@ -163,371 +430,328 @@ def analyze_script(path: Path) -> ScriptInfo:
                         m = resolve_string(node.args[1], info.constants)
                         if m:
                             mode = m
-                    for kw in node.keywords:
-                        if kw.arg == "mode":
-                            m = resolve_string(kw.value, info.constants)
-                            if m:
-                                mode = m
                     if any(c in mode for c in "wax"):
                         info.files_written.append(resolved)
                     else:
                         info.files_read.append(resolved)
+            # shaping ops
+            if attr in SHAPING_LABELS:
+                label = SHAPING_LABELS[attr]
+                info.shaping[label] = info.shaping.get(label, 0) + 1
+            # merges
+            mdesc = describe_merge(node, info.constants)
+            if mdesc:
+                info.merges.append(mdesc)
+
+    # functions
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info.functions.append({
+                "name": node.name,
+                "args": [a.arg for a in node.args.args],
+                "docstring": ast.get_docstring(node),
+            })
+
+    # calculations
+    info.calculations = detect_calculations(tree)
 
     def dedupe(seq):
         seen = set()
         return [x for x in seq if not (x in seen or seen.add(x))]
 
+    info.imports = dedupe(info.imports)
     info.files_read = dedupe(info.files_read)
     info.files_written = dedupe(info.files_written)
+    info.merges = dedupe(info.merges)
     return info
 
 
-# ---------- Input discovery + reach computation ----------
+# ---------- Optional local LLM (Ollama) ----------
 
-class InputFile:
-    def __init__(self, filename: str):
-        self.filename = filename
-        self.full_paths: list[str] = []
-        self.direct_consumers: list[str] = []     # scripts that read it directly
-        self.downstream_reach: list[str] = []     # direct + transitive
-        self.priority: str = ""
-        self.note: str = ""
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
 
-def discover_inputs(scripts: list[ScriptInfo]) -> dict[str, InputFile]:
-    """External input = read by some script, written by none."""
-    written_basenames = set()
-    for s in scripts:
-        for f in s.files_written:
-            written_basenames.add(Path(f).name)
-
-    inputs: dict[str, InputFile] = {}
-    for s in scripts:
-        for f in s.files_read:
-            base = Path(f).name
-            if base in written_basenames:
-                continue
-            if base not in inputs:
-                inputs[base] = InputFile(base)
-            if f not in inputs[base].full_paths:
-                inputs[base].full_paths.append(f)
-            if s.name not in inputs[base].direct_consumers:
-                inputs[base].direct_consumers.append(s.name)
-    return inputs
-
-
-def build_script_dependency_graph(scripts: list[ScriptInfo]) -> dict[str, set[str]]:
-    """
-    Returns {script_name: set of script_names that directly depend on it}.
-    Script B depends on script A if B reads a file A writes.
-    """
-    writers: dict[str, str] = {}  # intermediate filename -> producing script
-    for s in scripts:
-        for f in s.files_written:
-            writers[Path(f).name] = s.name
-
-    downstream: dict[str, set[str]] = {s.name: set() for s in scripts}
-    for s in scripts:
-        for f in s.files_read:
-            base = Path(f).name
-            producer = writers.get(base)
-            if producer and producer != s.name:
-                downstream[producer].add(s.name)
-    return downstream
-
-
-def compute_downstream_reach(inputs: dict[str, InputFile],
-                             downstream: dict[str, set[str]]) -> None:
-    """
-    For each input, walk the script dependency graph from its direct consumers
-    to find every script transitively influenced. Sets .downstream_reach.
-    """
-    def reach_from(start_scripts: list[str]) -> list[str]:
-        seen: set[str] = set()
-        stack = list(start_scripts)
-        while stack:
-            current = stack.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            for nxt in downstream.get(current, ()):
-                if nxt not in seen:
-                    stack.append(nxt)
-        return sorted(seen)
-
-    for inp in inputs.values():
-        inp.downstream_reach = reach_from(inp.direct_consumers)
-
-
-# ---------- Priorities file (team-driven) ----------
-
-def write_priorities_template(inputs: dict[str, InputFile], path: Path) -> None:
-    if path.exists():
-        return
-    template = {
-        "_instructions": (
-            "Set 'priority' for each input. Use ANY labels your team likes "
-            "(high/medium/low, P0/P1/P2, critical/standard, etc.) - the "
-            "analyzer auto-detects whatever labels you use and colors them. "
-            "'note' is optional free text. Re-run with --priorities pointing "
-            "at this file to update both diagrams."
-        ),
-        "inputs": {
-            name: {"priority": "", "note": ""}
-            for name in sorted(inputs.keys())
-        },
-    }
-    path.write_text(json.dumps(template, indent=2), encoding="utf-8")
-
-
-def load_priorities(path: Path, inputs: dict[str, InputFile]) -> bool:
+def ollama_available() -> bool:
+    """Quick check: is a local Ollama server reachable?"""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
     except Exception:
         return False
-    entries = data.get("inputs", {})
-    for name, meta in entries.items():
-        if name in inputs and isinstance(meta, dict):
-            inputs[name].priority = str(meta.get("priority", "") or "")
-            inputs[name].note = str(meta.get("note", "") or "")
-    return True
 
 
-# ---------- Auto color assignment for team-defined labels ----------
-
-# A palette of distinct, readable Mermaid styles. Assigned to whatever distinct
-# priority labels the team used, in order of first appearance.
-COLOR_PALETTE = [
-    "fill:#ffcdd2,stroke:#b71c1c,color:#7f0000,stroke-width:4px",   # red
-    "fill:#fff9c4,stroke:#f9a825,color:#5f4300,stroke-width:3px",   # amber
-    "fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20,stroke-width:2px",   # green
-    "fill:#bbdefb,stroke:#1565c0,color:#0d47a1,stroke-width:2px",   # blue
-    "fill:#e1bee7,stroke:#7b1fa2,color:#4a148c,stroke-width:2px",   # purple
-    "fill:#ffe0b2,stroke:#ef6c00,color:#e65100,stroke-width:2px",   # orange
-    "fill:#b2dfdb,stroke:#00695c,color:#004d40,stroke-width:2px",   # teal
-    "fill:#f8bbd0,stroke:#ad1457,color:#880e4f,stroke-width:2px",   # pink
-]
-UNSET_STYLE = "fill:#fafafa,stroke:#bdbdbd,color:#9e9e9e,stroke-width:1px,stroke-dasharray:4 3"
-
-
-def assign_priority_styles(inputs: dict[str, InputFile]) -> dict[str, str]:
-    """
-    Detect the distinct priority labels the team used and map each to a Mermaid
-    classDef name. Blank priority -> 'pri_unset'. Returns {label: class_name}.
-
-    If the team used common ordered words, sort those sensibly; otherwise keep
-    first-seen order.
-    """
-    # Collect distinct non-empty labels in first-seen order
-    seen: list[str] = []
-    for name in sorted(inputs.keys()):
-        p = inputs[name].priority.strip()
-        if p and p not in seen:
-            seen.append(p)
-
-    # If labels look like a known ordered scheme, sort them that way so the
-    # "most important" color (red) lands on the most important tier.
-    known_orders = [
-        ["high", "medium", "low"],
-        ["critical", "high", "medium", "low"],
-        ["p0", "p1", "p2", "p3"],
-        ["1", "2", "3", "4", "5"],
-    ]
-    lowered = [s.lower() for s in seen]
-    for order in known_orders:
-        if set(lowered).issubset(set(order)):
-            seen.sort(key=lambda s: order.index(s.lower()))
-            break
-
-    label_to_class: dict[str, str] = {}
-    for idx, label in enumerate(seen):
-        # class name must be identifier-safe
-        safe = "pri_" + re.sub(r"[^A-Za-z0-9_]", "_", label.lower())
-        label_to_class[label] = safe
-    return label_to_class
-
-
-def class_for(priority: str, label_to_class: dict[str, str]) -> str:
-    p = priority.strip()
-    if not p:
-        return "pri_unset"
-    return label_to_class.get(p, "pri_unset")
-
-
-def emit_classdefs(label_to_class: dict[str, str]) -> list[str]:
-    lines = []
-    palette_idx = 0
-    for label, class_name in label_to_class.items():
-        style = COLOR_PALETTE[palette_idx % len(COLOR_PALETTE)]
-        palette_idx += 1
-        lines.append(f"    classDef {class_name} {style}")
-    lines.append(f"    classDef pri_unset {UNSET_STYLE}")
-    return lines
-
-
-# ---------- Mermaid diagrams ----------
-
-def safe_node_id(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", "_", name)
-
-
-def sort_inputs(inputs: dict[str, InputFile], label_to_class: dict[str, str]):
-    """Sort inputs so higher-priority (earlier in label_to_class) float to top,
-    then by downstream reach size descending."""
-    label_rank = {label: i for i, label in enumerate(label_to_class.keys())}
-
-    def key(item):
-        name, inp = item
-        rank = label_rank.get(inp.priority.strip(), 999)
-        return (rank, -len(inp.downstream_reach), -len(inp.direct_consumers), name)
-
-    return sorted(inputs.items(), key=key)
-
-
-def build_diagram(inputs: dict[str, InputFile], label_to_class: dict[str, str],
-                  mode: str) -> str:
-    """
-    mode = 'direct'      -> arrows to scripts that read the input directly
-    mode = 'downstream'  -> arrows to every script in the input's reach
-    """
-    lines = ["```mermaid", "flowchart LR"]
-    sorted_inputs = sort_inputs(inputs, label_to_class)
-
-    # Input nodes
-    lines.append('    subgraph INPUTS["📥 External Input Files"]')
-    for name, inp in sorted_inputs:
-        node_id = "IN_" + safe_node_id(name)
-        pri_label = inp.priority.strip() or "unranked"
-        if mode == "direct":
-            count = len(inp.direct_consumers)
-            metric = f"{count} script{'s' if count != 1 else ''} read this directly"
-        else:
-            count = len(inp.downstream_reach)
-            metric = f"reaches {count} script{'s' if count != 1 else ''} total"
-        lines.append(
-            f'        {node_id}["<b>{name}</b><br/>'
-            f'priority: {pri_label}<br/>{metric}"]'
+def ollama_generate(model: str, prompt: str, timeout: int = 120) -> Optional[str]:
+    """Call the local Ollama server. Returns the response text, or None on failure."""
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
         )
-    lines.append("    end")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("response", "").strip()
+    except Exception:
+        return None
 
-    # Script nodes - only those involved in this mode
-    if mode == "direct":
-        involved = sorted({c for inp in inputs.values() for c in inp.direct_consumers})
-    else:
-        involved = sorted({c for inp in inputs.values() for c in inp.downstream_reach})
 
-    lines.append('    subgraph SCRIPTS["📄 Scripts"]')
-    for sname in involved:
-        node_id = safe_node_id(sname)
-        disp = sname.replace(".py", "")
-        lines.append(f'        {node_id}["{disp}"]')
-    lines.append("    end")
+def build_llm_prompt(info: ScriptInfo) -> str:
+    """
+    Build a grounded prompt: give the model the structured facts v7 already
+    extracted PLUS the source, and ask for prose. Grounding in extracted facts
+    keeps a small local model from hallucinating.
+    """
+    facts = []
+    facts.append(f"Script name: {info.name}")
+    if info.files_read:
+        facts.append("Reads files: " + ", ".join(Path(f).name for f in info.files_read))
+    if info.files_written:
+        facts.append("Writes files: " + ", ".join(Path(f).name for f in info.files_written))
+    if info.merges:
+        facts.append("Merges/joins detected: " + "; ".join(info.merges))
+    if info.calculations:
+        facts.append("Calculations detected:\n  - " + "\n  - ".join(info.calculations))
+    if info.shaping:
+        facts.append("Shaping operations: " + ", ".join(
+            f"{k} (x{v})" for k, v in sorted(info.shaping.items(), key=lambda kv: -kv[1])
+        ))
+    if info.section_comments:
+        facts.append("Section comments in order:\n  - " + "\n  - ".join(info.section_comments))
 
-    # Edges
-    for name, inp in sorted_inputs:
-        in_id = "IN_" + safe_node_id(name)
-        targets = inp.direct_consumers if mode == "direct" else inp.downstream_reach
-        direct_set = set(inp.direct_consumers)
-        for sname in targets:
-            if mode == "downstream" and sname not in direct_set:
-                # indirect reach - dashed/dotted arrow
-                lines.append(f"    {in_id} -.-> {safe_node_id(sname)}")
-            else:
-                lines.append(f"    {in_id} --> {safe_node_id(sname)}")
+    facts_block = "\n".join(facts)
 
-    # Priority styling
-    lines.extend(emit_classdefs(label_to_class))
-    for name, inp in sorted_inputs:
-        in_id = "IN_" + safe_node_id(name)
-        lines.append(f"    class {in_id} {class_for(inp.priority, label_to_class)}")
+    # Trim source so the prompt stays manageable for small local models
+    src = info.source
+    if len(src) > 8000:
+        src = src[:8000] + "\n# ... (truncated for length) ..."
 
-    lines.append("```")
-    return "\n".join(lines)
+    return f"""You are documenting a Python data-pipeline script for a team.
+
+Below are FACTS already extracted from the script by static analysis, followed
+by the script's SOURCE CODE. Use the facts as ground truth; use the source for
+detail. Do not invent file names or operations not present.
+
+=== EXTRACTED FACTS ===
+{facts_block}
+
+=== SOURCE CODE ===
+{src}
+
+=== YOUR TASK ===
+Respond in exactly this format, nothing else:
+
+PURPOSE: <one plain-English sentence: what this script does and why it exists in the pipeline>
+
+CALCULATIONS: <2-4 sentences explaining the mathematical calculations in plain English. If a numeric constant is a unit conversion, say so. For multiplication by a fraction (e.g. x * 0.9), describe it precisely as "scaled to 90% of the original" or "reduced by 10%" — never use the word "discount". If there are no real calculations, write "No significant mathematical calculations - this script is data shaping only.">
+
+SHAPING: <2-4 sentences explaining how the script reshapes/combines/filters data, in plain English>
+"""
+
+
+def parse_llm_response(text: str) -> dict[str, str]:
+    """Pull PURPOSE / CALCULATIONS / SHAPING sections out of the model's reply."""
+    out = {"purpose": "", "calculations": "", "shaping": ""}
+    if not text:
+        return out
+    # tolerant section parsing
+    patterns = {
+        "purpose": r"PURPOSE:\s*(.+?)(?=\n\s*(?:CALCULATIONS:|SHAPING:)|\Z)",
+        "calculations": r"CALCULATIONS:\s*(.+?)(?=\n\s*(?:PURPOSE:|SHAPING:)|\Z)",
+        "shaping": r"SHAPING:\s*(.+?)(?=\n\s*(?:PURPOSE:|CALCULATIONS:)|\Z)",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text, re.S | re.I)
+        if m:
+            out[key] = " ".join(m.group(1).split())
+    return out
+
+
+# ---------- LLM cache ----------
+
+def script_hash(info: ScriptInfo) -> str:
+    return hashlib.sha256(info.source.encode("utf-8")).hexdigest()[:16]
+
+
+def load_cache(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cache(path: Path, cache: dict) -> None:
+    try:
+        path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_llm_pass(scripts: list[ScriptInfo], model: str, cache_path: Path) -> int:
+    """
+    For each script, get LLM prose (from cache if the script is unchanged,
+    otherwise by calling Ollama). Returns the number of scripts the model
+    actually ran on (cache misses).
+    """
+    cache = load_cache(cache_path)
+    calls_made = 0
+    for info in scripts:
+        h = script_hash(info)
+        cache_key = f"{info.name}:{h}:{model}"
+        if cache_key in cache:
+            cached = cache[cache_key]
+            info.llm_purpose = cached.get("purpose", "")
+            info.llm_calc_prose = cached.get("calculations", "")
+            info.llm_shaping_prose = cached.get("shaping", "")
+            continue
+        prompt = build_llm_prompt(info)
+        print(f"  [LLM] summarizing {info.name} ...", flush=True)
+        response = ollama_generate(model, prompt)
+        calls_made += 1
+        parsed = parse_llm_response(response or "")
+        info.llm_purpose = parsed["purpose"]
+        info.llm_calc_prose = parsed["calculations"]
+        info.llm_shaping_prose = parsed["shaping"]
+        cache[cache_key] = parsed
+        save_cache(cache_path, cache)  # save incrementally so a crash doesn't lose work
+    return calls_made
 
 
 # ---------- Markdown rendering ----------
 
-def render_markdown(inputs: dict[str, InputFile], scripts: list[ScriptInfo],
-                    folder: Path, priorities_loaded: bool,
-                    priorities_path: Path) -> str:
-    label_to_class = assign_priority_styles(inputs)
-    sorted_inputs = sort_inputs(inputs, label_to_class)
+def infer_purpose_fallback(info: ScriptInfo) -> str:
+    """Used when no LLM prose is available."""
+    stem = re.sub(r"^\d+[_-]?", "", info.name.replace(".py", "")).replace("_", " ").strip()
+    bits = [stem.capitalize() if stem else "Pipeline script"]
+    if info.files_read:
+        bits.append(f"reads {len(info.files_read)} file(s)")
+    if info.files_written:
+        bits.append(f"writes {len(info.files_written)} file(s)")
+    return " — ".join(bits)
 
+
+def render_script_section(info: ScriptInfo) -> list[str]:
     lines = []
-    lines.append(f"# Input-Centric Pipeline View: `{folder.name}`\n")
-    lines.append(f"_{len(inputs)} external input files · {len(scripts)} scripts_\n")
+    lines.append(f"## `{info.name}`\n")
+    lines.append(f"_{info.line_count} lines · libraries: "
+                 + (", ".join(f"`{i}`" for i in info.imports) or "none") + "_\n")
 
-    if priorities_loaded:
-        ranked = sum(1 for i in inputs.values() if i.priority.strip())
-        labels_used = ", ".join(f"`{l}`" for l in label_to_class.keys()) or "_none_"
+    # 1. Purpose
+    lines.append("### 1. Purpose\n")
+    if info.llm_purpose:
+        lines.append(info.llm_purpose + "\n")
+    elif info.docstring:
+        lines.append(info.docstring.strip().split("\n")[0] + "\n")
+    else:
+        lines.append(f"_{infer_purpose_fallback(info)}_  ")
+        lines.append("_(run with `--llm` for a written purpose)_\n")
+
+    # 2. Inputs
+    lines.append("### 2. Inputs (files read)\n")
+    if info.files_read:
+        for f in info.files_read:
+            lines.append(f"- `{f}`")
+    else:
+        lines.append("- _None detected._")
+    lines.append("")
+
+    # 3. Outputs
+    lines.append("### 3. Outputs (files written)\n")
+    if info.files_written:
+        for f in info.files_written:
+            lines.append(f"- `{f}`")
+    else:
+        lines.append("- _None detected._")
+    lines.append("")
+
+    # 4. Calculations
+    lines.append("### 4. Calculations (the math)\n")
+    if info.llm_calc_prose:
+        lines.append(info.llm_calc_prose + "\n")
+    if info.calculations:
+        lines.append("_Detected operations:_")
+        for c in info.calculations:
+            lines.append(f"- {c}")
+        lines.append("")
+    elif not info.llm_calc_prose:
+        lines.append("_No mathematical calculations detected — this script is "
+                     "data shaping only._\n")
+
+    # 5. Data shaping
+    lines.append("### 5. Data shaping\n")
+    if info.llm_shaping_prose:
+        lines.append(info.llm_shaping_prose + "\n")
+    if info.merges:
+        lines.append("**Joins / merges:**")
+        for m in info.merges:
+            lines.append(f"- {m}")
+        lines.append("")
+    if info.shaping:
+        ops = sorted(info.shaping.items(), key=lambda kv: -kv[1])
+        lines.append("**Operations:** "
+                     + ", ".join(f"{label} ×{count}" for label, count in ops) + "\n")
+    if info.section_comments:
+        lines.append("**Step outline (from section comments):**")
+        for i, c in enumerate(info.section_comments, 1):
+            lines.append(f"{i}. {c}")
+        lines.append("")
+    if not (info.merges or info.shaping or info.section_comments or info.llm_shaping_prose):
+        lines.append("_No data-shaping operations detected._\n")
+
+    # Functions
+    if info.functions:
+        lines.append("**Functions defined:**")
+        for fn in info.functions:
+            sig = f"`{fn['name']}({', '.join(fn['args'])})`"
+            doc = fn["docstring"].strip().split("\n")[0] if fn["docstring"] else ""
+            lines.append(f"- {sig}" + (f" — {doc}" if doc else ""))
+        lines.append("")
+
+    # Open items
+    if info.todos:
+        lines.append("### ⚠️ Open items flagged in the code\n")
+        for t in info.todos:
+            lines.append(f"- {t}")
+        lines.append("")
+
+    lines.append("---\n")
+    return lines
+
+
+def render_markdown(scripts: list[ScriptInfo], folder: Path,
+                    llm_used: bool, model: str, calls_made: int) -> str:
+    lines = []
+    lines.append(f"# Per-Script Summaries: `{folder.name}`\n")
+    lines.append(f"_{len(scripts)} scripts · five-part breakdown_\n")
+
+    if llm_used:
         lines.append(
-            f"> ✅ Team priorities loaded from `{priorities_path.name}` — "
-            f"{ranked} of {len(inputs)} inputs ranked. Labels in use: {labels_used}\n"
+            f"> ✅ Local LLM prose enabled (`{model}` via Ollama). "
+            f"{calls_made} script(s) summarized this run; the rest came from cache.\n"
         )
     else:
         lines.append(
-            f"> 📝 A priorities template has been written to "
-            f"`{priorities_path.name}`. Have the team fill in the `priority` "
-            f"field (any labels they like), then re-run with "
-            f"`--priorities {priorities_path.name}`.\n"
+            "> ℹ️ Structured extraction only. For written purpose/calculation/"
+            "shaping prose, install Ollama, `ollama pull qwen2.5-coder:7b`, and "
+            "re-run with `--llm`.\n"
         )
 
-    # Diagram A - direct
-    lines.append("## Diagram A — Direct Reads\n")
-    lines.append(
-        "Which scripts read each input **directly**. This is the immediate "
-        "dependency picture.\n"
-    )
-    lines.append(build_diagram(inputs, label_to_class, mode="direct"))
+    # Contents
+    lines.append("## Contents\n")
+    for s in scripts:
+        anchor = s.name.lower().replace(".", "").replace("_", "")
+        lines.append(f"- [`{s.name}`](#{anchor})")
     lines.append("")
 
-    # Diagram B - downstream reach
-    lines.append("## Diagram B — Downstream Reach\n")
-    lines.append(
-        "Every script each input **ultimately influences** — direct readers "
-        "(solid arrows) plus scripts downstream of them via intermediate files "
-        "(dashed arrows). This is the input's blast radius: if the input is "
-        "wrong, this is how much of the pipeline is affected.\n"
-    )
-    lines.append(build_diagram(inputs, label_to_class, mode="downstream"))
-    lines.append("")
-
-    # Inventory table
-    lines.append("## Input Inventory\n")
-    lines.append("| Input File | Priority | Direct Reads | Total Reach | Reach (scripts) | Note |")
-    lines.append("|------------|----------|--------------|-------------|-----------------|------|")
-    for name, inp in sorted_inputs:
-        pri = inp.priority.strip() or "_unranked_"
-        direct = len(inp.direct_consumers)
-        total = len(inp.downstream_reach)
-        reach_list = ", ".join(c.replace(".py", "") for c in inp.downstream_reach) or "—"
-        note = inp.note.strip() or ""
-        lines.append(f"| `{name}` | {pri} | {direct} | {total} | {reach_list} | {note} |")
-    lines.append("")
-
-    # Per-input detail
-    lines.append("## Input Detail\n")
-    for name, inp in sorted_inputs:
-        lines.append(f"### `{name}`\n")
-        lines.append(f"- **Priority:** {inp.priority.strip() or '_unranked_'}")
-        if inp.note.strip():
-            lines.append(f"- **Note:** {inp.note.strip()}")
-        lines.append(
-            f"- **Direct readers ({len(inp.direct_consumers)}):** "
-            + (", ".join(f"`{c}`" for c in inp.direct_consumers) or "—")
-        )
-        indirect = [s for s in inp.downstream_reach if s not in set(inp.direct_consumers)]
-        lines.append(
-            f"- **Indirect (downstream) reach ({len(indirect)}):** "
-            + (", ".join(f"`{c}`" for c in indirect) or "—")
-        )
-        lines.append(f"- **Total reach:** {len(inp.downstream_reach)} script(s)")
-        if len(inp.full_paths) > 1:
-            lines.append("- **Paths seen:** " + ", ".join(f"`{p}`" for p in inp.full_paths))
-        elif inp.full_paths:
-            lines.append(f"- **Path:** `{inp.full_paths[0]}`")
-        lines.append("")
-        lines.append("---\n")
+    for s in scripts:
+        lines.extend(render_script_section(s))
 
     return "\n".join(lines)
 
@@ -535,12 +759,15 @@ def render_markdown(inputs: dict[str, InputFile], scripts: list[ScriptInfo],
 # ---------- Main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("folder", help="Path to folder containing pipeline .py files")
-    parser.add_argument("-o", "--output", default="input_overview.md")
-    parser.add_argument("--priorities", default=None,
-                        help="Path to the team's input_priorities.json. If "
-                             "omitted, a template is written next to the output.")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("folder", help="Folder containing pipeline .py files")
+    parser.add_argument("-o", "--output", default="script_summaries.md")
+    parser.add_argument("--llm", action="store_true",
+                        help="Use a local Ollama model for prose (purpose, "
+                             "calculation and shaping explanations)")
+    parser.add_argument("--model", default="qwen2.5-coder:7b",
+                        help="Ollama model name (default: qwen2.5-coder:7b)")
     args = parser.parse_args()
 
     folder = Path(args.folder).resolve()
@@ -552,44 +779,33 @@ def main():
     if not py_files:
         raise SystemExit(f"No .py files found in {folder}")
 
+    print(f"Analyzing {len(py_files)} script(s) ...")
     scripts = [analyze_script(p) for p in py_files]
-    inputs = discover_inputs(scripts)
 
-    if not inputs:
-        raise SystemExit(
-            "No external input files detected. Either the scripts build their "
-            "paths in a way the analyzer can't resolve yet, or every file read "
-            "is produced by another script in the folder."
-        )
+    llm_used = False
+    calls_made = 0
+    if args.llm:
+        if ollama_available():
+            print(f"Ollama detected — running prose pass with '{args.model}'")
+            print("(first run may be slow; results are cached for next time)")
+            cache_path = Path(args.output).resolve().parent / ".summary_cache.json"
+            calls_made = run_llm_pass(scripts, args.model, cache_path)
+            llm_used = True
+        else:
+            print("⚠️  --llm requested but no Ollama server found at "
+                  "localhost:11434.")
+            print("    Producing the structured summary without prose. To enable:")
+            print("    1) install Ollama  2) `ollama pull qwen2.5-coder:7b`  "
+                  "3) make sure it's running  4) re-run with --llm")
 
-    # Compute downstream reach
-    downstream = build_script_dependency_graph(scripts)
-    compute_downstream_reach(inputs, downstream)
-
-    # Priorities file location
-    if args.priorities:
-        priorities_path = Path(args.priorities).resolve()
-    else:
-        priorities_path = Path(args.output).resolve().parent / "input_priorities.json"
-
-    priorities_loaded = False
-    if priorities_path.exists():
-        priorities_loaded = load_priorities(priorities_path, inputs)
-    else:
-        write_priorities_template(inputs, priorities_path)
-
-    output = render_markdown(inputs, scripts, folder, priorities_loaded, priorities_path)
+    output = render_markdown(scripts, folder, llm_used, args.model, calls_made)
     out_path = Path(args.output).resolve()
     out_path.write_text(output, encoding="utf-8")
 
-    print(f"Wrote {out_path}")
-    print(f"Found {len(inputs)} external input file(s).")
-    if priorities_loaded:
-        print(f"Loaded team priorities from {priorities_path}")
-    else:
-        print(f"Wrote priorities template to {priorities_path}")
-        print("Have the team fill it in, then re-run with --priorities "
-              f"{priorities_path.name}")
+    print(f"\nWrote {out_path}")
+    print(f"Summarized {len(scripts)} script(s).")
+    if llm_used:
+        print(f"LLM prose: {calls_made} fresh, {len(scripts) - calls_made} from cache.")
 
 
 if __name__ == "__main__":
