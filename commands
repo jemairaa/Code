@@ -125,6 +125,14 @@ class ScriptInfo:
         self.health: dict = {}  # metrics: loc, sloc, comments, functions,
                                 # max_complexity, complex_funcs, long_funcs,
                                 # maintainability, deep_nesting, etc.
+        # deliverable/onboarding prose (v9, optional, LLM-filled)
+        self.deliv_plain: str = ""   # plain-language "what & why"
+        self.deliv_inout: str = ""   # plain-language "what goes in/out"
+        self.deliv_watch: str = ""   # plain-language "what to watch for"
+        # deliverable/onboarding prose (v9) — plain language, no jargon
+        self.deliv_plain: str = ""   # what it does + why it matters
+        self.deliv_inout: str = ""   # what goes in / comes out, in plain terms
+        self.deliv_watch: str = ""   # what a new analyst should watch for
 
 
 # ---------- AST path-resolution engine (shared with v2-v6) ----------
@@ -695,43 +703,83 @@ SHAPING: <2-4 sentences explaining how the script reshapes/combines/filters data
 """
 
 
-def parse_llm_response(text: str) -> dict[str, str]:
+def build_deliverable_prompt(info: ScriptInfo) -> str:
     """
-    Pull PURPOSE / CALCULATIONS / SHAPING out of the model's reply.
+    Deliverable/onboarding variant: ask the model for plain-language output
+    aimed at a NEW ANALYST who knows the mission domain but not the code.
+    No pandas jargon, no function names — explain it the way you'd brief a
+    new teammate on their first day.
+    """
+    facts = []
+    facts.append(f"Script name: {info.name}")
+    if info.files_read:
+        facts.append("Reads files: " + ", ".join(Path(f).name for f in info.files_read))
+    if info.files_written:
+        facts.append("Writes files: " + ", ".join(Path(f).name for f in info.files_written))
+    if info.merges:
+        facts.append("Combines these datasets: " + "; ".join(info.merges))
+    if info.calculations:
+        facts.append("Calculations detected:\n  - " + "\n  - ".join(info.calculations))
+    if info.section_comments:
+        facts.append("Step comments in order:\n  - " + "\n  - ".join(info.section_comments))
+    facts_block = "\n".join(facts)
 
-    Small local models do NOT reliably emit the exact 'PURPOSE:' headers, so
-    this parser is deliberately forgiving. It accepts, in order of preference:
-      1. The exact 'PURPOSE:' / 'CALCULATIONS:' / 'SHAPING:' labels
-      2. Markdown / bold / numbered variants like '## Purpose', '**Purpose**',
-         '1. Purpose', 'Purpose -'
-      3. If no labels are found at all, it does NOT discard the response - it
-         puts the whole reply in 'purpose' so the model's work is never lost.
+    src = info.source
+    if len(src) > 8000:
+        src = src[:8000] + "\n# ... (truncated for length) ..."
+
+    return f"""You are writing onboarding documentation for a NEW ANALYST joining
+a team. They understand the mission and the data domain, but they do NOT read
+Python and should never need to. Explain this pipeline step the way you would
+brief a new teammate on their first day — in plain language, no code terms, no
+library names, no function names.
+
+Below are FACTS extracted from the script, then its SOURCE CODE for your
+reference only. Use the facts as ground truth. Never invent data sources.
+
+=== EXTRACTED FACTS ===
+{facts_block}
+
+=== SOURCE CODE (reference only — do not quote it) ===
+{src}
+
+=== YOUR TASK ===
+Respond in exactly this format, nothing else. Keep every section tight and
+jargon-free. Imagine the reader asking "what does this step do and why should
+I care?"
+
+PLAIN: <2-4 sentences: in plain language, what this step does and why it matters to the overall pipeline. No code terms.>
+
+INOUT: <1-2 sentences: in plain language, what information goes IN and what comes OUT. Describe the data by what it represents, not file names.>
+
+WATCH: <1-2 sentences: what a new analyst should be careful about here — known issues, assumptions, or things that could surprise them. If nothing notable, write "Nothing unusual to flag for this step.">
+"""
+
+
+def _parse_labeled_response(text: str, labels: dict[str, str],
+                            fallback_key: str) -> dict[str, str]:
     """
-    out = {"purpose": "", "calculations": "", "shaping": ""}
+    Generic tolerant section parser. `labels` maps output keys to a regex
+    alternation for that section's header (e.g. {"purpose": "PURPOSE"}).
+    Accepts markdown/bold/numbered/dash variants. If NO labels match, the
+    whole reply is kept under `fallback_key` so model output is never lost.
+    """
+    out = {k: "" for k in labels}
     if not text or not text.strip():
         return out
 
     text = text.strip()
-    # strip common code-fence wrappers some models add
     text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text)
 
-    # Build a flexible label matcher: optional markdown (#, *, digits, dashes)
-    # then the word, then optional punctuation (: - ) etc.
     def section_pattern(label: str, others: list[str]) -> str:
         lead = r"(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|\d+\.\s*|-\s*)?"
-        name = rf"{label}\s*\*{{0,2}}\s*[:\-\u2013)]*\s*"
-        # stop at the next known section label (any variant) or end
-        stops = "|".join(others + [label])
+        # wrap the label (which may itself contain alternation) so it can't
+        # leak into surrounding regex structure
+        name = rf"(?:{label})\s*\*{{0,2}}\s*[:\-\u2013)]*\s*"
+        stops = "|".join(f"(?:{o})" for o in (others + [label]))
         stop = rf"(?=\n\s*(?:#{{1,6}}\s*|\*{{1,2}}\s*|\d+\.\s*|-\s*)?(?:{stops})\b|\Z)"
         return lead + name + r"(.+?)" + stop
-
-    labels = {
-        "purpose": "PURPOSE",
-        "calculations": "CALCULATION(?:S)?",
-        "shaping": "(?:DATA[ _]?)?SHAPING",
-    }
-    all_label_alts = list(labels.values())
 
     found_any = False
     for key, lab in labels.items():
@@ -744,13 +792,35 @@ def parse_llm_response(text: str) -> dict[str, str]:
                 out[key] = val
                 found_any = True
 
-    # Fallback: model ignored the format entirely. Don't throw the answer away
-    # - keep it as the purpose so the user still sees the model's summary.
     if not found_any:
-        cleaned = " ".join(text.split())
-        out["purpose"] = cleaned[:1200]
-
+        out[fallback_key] = " ".join(text.split())[:1200]
     return out
+
+
+def parse_llm_response(text: str) -> dict[str, str]:
+    """Technical prose: PURPOSE / CALCULATIONS / SHAPING (tolerant)."""
+    return _parse_labeled_response(
+        text,
+        {
+            "purpose": "PURPOSE",
+            "calculations": "CALCULATION(?:S)?",
+            "shaping": "(?:DATA[ _]?)?SHAPING",
+        },
+        fallback_key="purpose",
+    )
+
+
+def parse_deliverable_response(text: str) -> dict[str, str]:
+    """Onboarding prose: PLAIN / INOUT / WATCH (tolerant)."""
+    return _parse_labeled_response(
+        text,
+        {
+            "plain": "PLAIN",
+            "inout": "INOUT|IN\\s*[ _/&]\\s*OUT|INPUTS?\\s*[ _/&]?\\s*OUTPUTS?|IN\\s*AND\\s*OUT",
+            "watch": "WATCH|WATCH[ _]?OUT|CAUTION|GOTCHAS?",
+        },
+        fallback_key="plain",
+    )
 
 
 # ---------- LLM cache ----------
@@ -775,34 +845,52 @@ def save_cache(path: Path, cache: dict) -> None:
         pass
 
 
-def run_llm_pass(scripts: list[ScriptInfo], model: str, cache_path: Path) -> int:
+def run_llm_pass(scripts: list[ScriptInfo], model: str, cache_path: Path,
+                 deliverable: bool = False) -> int:
     """
     For each script, get LLM prose (from cache if the script is unchanged,
     otherwise by calling Ollama). Returns the number of scripts the model
     actually ran on (cache misses).
+
+    When `deliverable` is True, generates plain-language onboarding prose
+    (PLAIN/INOUT/WATCH) instead of the technical prose, using a distinct
+    cache key so the two prose styles never collide in the cache.
     """
     cache = load_cache(cache_path)
     calls_made = 0
     for info in scripts:
         h = script_hash(info)
-        cache_key = f"{info.name}:{h}:{model}"
+        mode_tag = "deliv" if deliverable else "tech"
+        cache_key = f"{info.name}:{h}:{model}:{mode_tag}"
         if cache_key in cache:
             cached = cache[cache_key]
-            info.llm_purpose = cached.get("purpose", "")
-            info.llm_calc_prose = cached.get("calculations", "")
-            info.llm_shaping_prose = cached.get("shaping", "")
+            if deliverable:
+                info.deliv_plain = cached.get("plain", "")
+                info.deliv_inout = cached.get("inout", "")
+                info.deliv_watch = cached.get("watch", "")
+            else:
+                info.llm_purpose = cached.get("purpose", "")
+                info.llm_calc_prose = cached.get("calculations", "")
+                info.llm_shaping_prose = cached.get("shaping", "")
             continue
-        prompt = build_llm_prompt(info)
+        prompt = (build_deliverable_prompt(info) if deliverable
+                  else build_llm_prompt(info))
         print(f"  [LLM] summarizing {info.name} ...", end="", flush=True)
         _t0 = _time.time()
         response = ollama_generate(model, prompt)
         _elapsed = _time.time() - _t0
         print(f" done ({_elapsed:.0f}s)", flush=True)
         calls_made += 1
-        parsed = parse_llm_response(response or "")
-        info.llm_purpose = parsed["purpose"]
-        info.llm_calc_prose = parsed["calculations"]
-        info.llm_shaping_prose = parsed["shaping"]
+        if deliverable:
+            parsed = parse_deliverable_response(response or "")
+            info.deliv_plain = parsed["plain"]
+            info.deliv_inout = parsed["inout"]
+            info.deliv_watch = parsed["watch"]
+        else:
+            parsed = parse_llm_response(response or "")
+            info.llm_purpose = parsed["purpose"]
+            info.llm_calc_prose = parsed["calculations"]
+            info.llm_shaping_prose = parsed["shaping"]
         # keep the raw response in the cache too, so the parser can be
         # improved later and re-applied WITHOUT re-calling the model
         parsed_with_raw = dict(parsed)
@@ -963,6 +1051,127 @@ def render_script_section(info: ScriptInfo) -> list[str]:
     return lines
 
 
+def _plain_title(name: str) -> str:
+    """'11_generate_laydown_file.py' -> 'Step 11 — Generate Laydown File'."""
+    m = re.match(r"^(\d+)[_-]?(.*)\.py$", name)
+    if m:
+        num, rest = m.group(1), m.group(2)
+        words = rest.replace("_", " ").strip().title()
+        return f"Step {num} — {words}" if words else f"Step {num}"
+    return name.replace(".py", "").replace("_", " ").title()
+
+
+def render_deliverable(scripts: list[ScriptInfo], folder: Path,
+                       llm_used: bool, model: str, calls_made: int) -> str:
+    """
+    Onboarding deliverable: plain-language lead per step, technical detail
+    tucked into collapsible <details> blocks. Aimed at a NEW ANALYST who
+    knows the mission domain but does not read code.
+    """
+    L = []
+    L.append(f"# {folder.name}: How This Pipeline Works\n")
+    L.append("_An onboarding guide. Plain-language explanation up top; "
+             "click **“Technical detail”** under any step to see the "
+             "engineering specifics._\n")
+
+    if not llm_used:
+        L.append(
+            "> ⚠️ **This guide needs the plain-language pass to be useful.** "
+            "Re-run with `--deliverable --llm` (Ollama running) so each step "
+            "gets a written, jargon-free explanation. Without it, only the "
+            "technical detail is available.\n"
+        )
+
+    # ---- Start here: whole-pipeline orientation ----
+    L.append("## Start here\n")
+    n = len(scripts)
+    first = scripts[0].name if scripts else "the first script"
+    last = scripts[-1].name if scripts else "the last script"
+    L.append(
+        f"This pipeline is **{n} steps** that run in order. Each step reads "
+        f"data files, does its part, and writes files the next step picks up — "
+        f"like a relay. You start at `{first}` and finish at `{last}`. "
+        f"You rarely run one step alone; they’re meant to run start to finish.\n"
+    )
+    L.append("**The steps at a glance:**\n")
+    L.append("| # | Step | In one sentence |")
+    L.append("|---|------|-----------------|")
+    for s in scripts:
+        if s.deliv_plain:
+            # first sentence, but keep it meaningful (not just a 3-word clause)
+            m = re.match(r"(.+?[.!?])(\s|$)", s.deliv_plain.strip())
+            one_liner = m.group(1).strip() if m else s.deliv_plain.strip()
+            if len(one_liner) < 25 and ". " in s.deliv_plain:
+                one_liner = s.deliv_plain.split(". ", 1)[0].strip() + "."
+        else:
+            one_liner = infer_purpose_fallback(s)
+        if len(one_liner) > 140:
+            one_liner = one_liner[:137] + "..."
+        L.append(f"| {s.name.split('_')[0]} | `{s.name}` | {one_liner} |")
+    L.append("")
+
+    # ---- Aggregated "things to watch" across the whole pipeline ----
+    watch_items = []
+    for s in scripts:
+        for t in s.todos:
+            watch_items.append((s.name, t))
+    if watch_items:
+        L.append("## Things to watch across the pipeline\n")
+        L.append("_Open items and known issues the team has flagged in the "
+                 "code. Worth knowing before you rely on the outputs._\n")
+        for name, t in watch_items:
+            L.append(f"- **{_plain_title(name)}:** {t}")
+        L.append("")
+
+    L.append("---\n")
+
+    # ---- Per-step ----
+    for s in scripts:
+        L.append(f"## {_plain_title(s.name)}\n")
+        L.append(f"<sub>`{s.name}`</sub>\n")
+
+        # What it does + why it matters
+        if s.deliv_plain:
+            L.append(f"**What this step does.** {s.deliv_plain}\n")
+        else:
+            L.append(f"**What this step does.** _{infer_purpose_fallback(s)}_ "
+                     "(run with `--deliverable --llm` for a written "
+                     "explanation)\n")
+
+        # In / out, plain language
+        if s.deliv_inout:
+            L.append(f"**What goes in and comes out.** {s.deliv_inout}\n")
+        else:
+            ins = len(s.files_read)
+            outs = len(s.files_written)
+            L.append(f"**What goes in and comes out.** Reads {ins} data "
+                     f"file(s); produces {outs} file(s).\n")
+
+        # Watch-outs
+        if s.deliv_watch:
+            L.append(f"**Watch out for.** {s.deliv_watch}\n")
+        elif s.todos:
+            L.append("**Watch out for.** "
+                     + s.todos[0]
+                     + (" …and more (see technical detail)."
+                        if len(s.todos) > 1 else "")
+                     + "\n")
+
+        # Collapsible technical detail = the existing v8 section, verbatim
+        tech = render_script_section(s)
+        # drop the trailing '---' separator inside the details block
+        if tech and tech[-1].strip() == "---":
+            tech = tech[:-1]
+        L.append("<details>")
+        L.append("<summary><b>Technical detail</b> (for engineers — "
+                 "click to expand)</summary>\n")
+        L.extend(tech)
+        L.append("</details>\n")
+        L.append("---\n")
+
+    return "\n".join(L)
+
+
 def render_markdown(scripts: list[ScriptInfo], folder: Path,
                     llm_used: bool, model: str, calls_made: int) -> str:
     lines = []
@@ -1017,13 +1226,23 @@ def main():
                         help="Also analyze analyzer/tooling files "
                              "(pipeline_analyzer_*.py, analyze_pipeline.py, "
                              "pyreverse.py). Excluded by default.")
+    parser.add_argument("--deliverable", action="store_true",
+                        help="Onboarding-deliverable mode: plain-language "
+                             "explanation per step with technical detail in "
+                             "collapsible sections. Aimed at new analysts who "
+                             "know the domain, not the code. Best with --llm.")
     args = parser.parse_args()
 
     folder = Path(args.folder).resolve()
     if not folder.is_dir():
         raise SystemExit(f"Not a directory: {folder}")
 
-    py_files = sorted(folder.glob("*.py"))
+    def _pipeline_sort_key(p: Path):
+        # Sort by the leading number if present (so 2 < 11), else by name.
+        m = re.match(r"^(\d+)", p.name)
+        return (0, int(m.group(1)), p.name) if m else (1, 0, p.name)
+
+    py_files = sorted(folder.glob("*.py"), key=_pipeline_sort_key)
     py_files = [p for p in py_files if p.name != Path(__file__).name]
 
     # Auto-exclude analyzer/tooling files unless --include-tools is set.
@@ -1069,10 +1288,13 @@ def main():
     calls_made = 0
     if args.llm:
         if ollama_available():
-            print(f"Ollama detected — running prose pass with '{args.model}'")
+            mode = "onboarding/deliverable" if args.deliverable else "technical"
+            print(f"Ollama detected — running {mode} prose pass with "
+                  f"'{args.model}'")
             print("(first run may be slow; results are cached for next time)")
             cache_path = Path(args.output).resolve().parent / ".summary_cache.json"
-            calls_made = run_llm_pass(scripts, args.model, cache_path)
+            calls_made = run_llm_pass(scripts, args.model, cache_path,
+                                      deliverable=args.deliverable)
             llm_used = True
         else:
             print("⚠️  --llm requested but no Ollama server found at "
@@ -1081,7 +1303,12 @@ def main():
             print("    1) install Ollama  2) `ollama pull qwen2.5-coder:7b`  "
                   "3) make sure it's running  4) re-run with --llm")
 
-    output = render_markdown(scripts, folder, llm_used, args.model, calls_made)
+    if args.deliverable:
+        output = render_deliverable(scripts, folder, llm_used,
+                                    args.model, calls_made)
+    else:
+        output = render_markdown(scripts, folder, llm_used,
+                                 args.model, calls_made)
     out_path = Path(args.output).resolve()
     out_path.write_text(output, encoding="utf-8")
 
