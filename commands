@@ -50,6 +50,7 @@ import io
 import json
 import re
 import tokenize
+import time as _time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -120,6 +121,10 @@ class ScriptInfo:
         self.llm_purpose: str = ""
         self.llm_calc_prose: str = ""
         self.llm_shaping_prose: str = ""
+        # code-health (v8) — all deterministic, computed from the AST
+        self.health: dict = {}  # metrics: loc, sloc, comments, functions,
+                                # max_complexity, complex_funcs, long_funcs,
+                                # maintainability, deep_nesting, etc.
 
 
 # ---------- AST path-resolution engine (shared with v2-v6) ----------
@@ -463,10 +468,146 @@ def analyze_script(path: Path) -> ScriptInfo:
     info.files_read = dedupe(info.files_read)
     info.files_written = dedupe(info.files_written)
     info.merges = dedupe(info.merges)
+
+    # code-health metrics (deterministic, no external deps required)
+    info.health = compute_health(tree, info.source)
     return info
 
 
-# ---------- Optional local LLM (Ollama) ----------
+# ---------- Code-health analysis (v8, deterministic) ----------
+
+def _cyclomatic_complexity(func_node) -> int:
+    """
+    McCabe cyclomatic complexity for a function: 1 + number of decision points.
+    Counts if/elif, for, while, except, with, boolean and/or, comprehension
+    conditions, ternary expressions. This is the same idea radon uses; we
+    compute it natively so v8 needs no extra install.
+    """
+    complexity = 1
+    for n in ast.walk(func_node):
+        if isinstance(n, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            complexity += 1
+        elif isinstance(n, ast.ExceptHandler):
+            complexity += 1
+        elif isinstance(n, ast.BoolOp):
+            # each extra operand in an and/or chain is a branch
+            complexity += max(0, len(n.values) - 1)
+        elif isinstance(n, ast.IfExp):  # ternary
+            complexity += 1
+        elif isinstance(n, ast.comprehension):
+            complexity += 1 + len(n.ifs)
+    return complexity
+
+
+def _max_nesting_depth(func_node) -> int:
+    """Deepest level of nested control structures inside a function."""
+    nesting_types = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+                     ast.AsyncWith, ast.Try)
+
+    def depth(node, current=0):
+        best = current
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nesting_types):
+                best = max(best, depth(child, current + 1))
+            else:
+                best = max(best, depth(child, current))
+        return best
+
+    return depth(func_node, 0)
+
+
+def compute_health(tree: ast.AST, source: str) -> dict:
+    """
+    Produce a deterministic 'code health' snapshot for one script:
+      - line counts (total, code, comment, blank)
+      - per-function cyclomatic complexity and length
+      - flags for overly complex / very long / deeply nested functions
+      - a simple maintainability band (good / moderate / needs attention)
+    Uses radon for a maintainability index if it happens to be installed;
+    otherwise derives a comparable band natively.
+    """
+    lines = source.splitlines()
+    total = len(lines)
+    blank = sum(1 for l in lines if not l.strip())
+    comment = sum(1 for l in lines if l.strip().startswith("#"))
+    code_lines = total - blank - comment
+
+    funcs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = node.lineno
+            end = max(
+                [start] + [getattr(c, "end_lineno", start) or start
+                           for c in ast.walk(node)]
+            )
+            length = end - start + 1
+            cc = _cyclomatic_complexity(node)
+            nest = _max_nesting_depth(node)
+            funcs.append({
+                "name": node.name, "length": length,
+                "complexity": cc, "nesting": nest, "lineno": start,
+            })
+
+    max_cc = max((f["complexity"] for f in funcs), default=0)
+    max_len = max((f["length"] for f in funcs), default=0)
+    max_nest = max((f["nesting"] for f in funcs), default=0)
+
+    complex_funcs = sorted(
+        [f for f in funcs if f["complexity"] >= 10],
+        key=lambda f: -f["complexity"],
+    )
+    long_funcs = sorted(
+        [f for f in funcs if f["length"] >= 60],
+        key=lambda f: -f["length"],
+    )
+    deep_funcs = sorted(
+        [f for f in funcs if f["nesting"] >= 4],
+        key=lambda f: -f["nesting"],
+    )
+
+    # Optional: radon maintainability index, if installed. Never required.
+    mi_score = None
+    try:
+        from radon.metrics import mi_visit  # type: ignore
+        mi_score = round(mi_visit(source, multi=True), 1)
+    except Exception:
+        mi_score = None
+
+    # Native maintainability band when radon isn't present (or to summarize MI)
+    if mi_score is not None:
+        if mi_score >= 20:
+            band = "good"
+        elif mi_score >= 10:
+            band = "moderate"
+        else:
+            band = "needs attention"
+    else:
+        # derive a band from our own signals
+        if max_cc >= 15 or max_len >= 120 or max_nest >= 5:
+            band = "needs attention"
+        elif max_cc >= 8 or max_len >= 60 or max_nest >= 4:
+            band = "moderate"
+        else:
+            band = "good"
+
+    comment_ratio = round(comment / total * 100, 1) if total else 0.0
+
+    return {
+        "total_lines": total,
+        "code_lines": code_lines,
+        "comment_lines": comment,
+        "blank_lines": blank,
+        "comment_ratio": comment_ratio,
+        "function_count": len(funcs),
+        "max_complexity": max_cc,
+        "max_function_length": max_len,
+        "max_nesting": max_nest,
+        "complex_functions": complex_funcs[:5],
+        "long_functions": long_funcs[:5],
+        "deep_functions": deep_funcs[:5],
+        "maintainability_index": mi_score,
+        "maintainability_band": band,
+    }
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -555,20 +696,60 @@ SHAPING: <2-4 sentences explaining how the script reshapes/combines/filters data
 
 
 def parse_llm_response(text: str) -> dict[str, str]:
-    """Pull PURPOSE / CALCULATIONS / SHAPING sections out of the model's reply."""
+    """
+    Pull PURPOSE / CALCULATIONS / SHAPING out of the model's reply.
+
+    Small local models do NOT reliably emit the exact 'PURPOSE:' headers, so
+    this parser is deliberately forgiving. It accepts, in order of preference:
+      1. The exact 'PURPOSE:' / 'CALCULATIONS:' / 'SHAPING:' labels
+      2. Markdown / bold / numbered variants like '## Purpose', '**Purpose**',
+         '1. Purpose', 'Purpose -'
+      3. If no labels are found at all, it does NOT discard the response - it
+         puts the whole reply in 'purpose' so the model's work is never lost.
+    """
     out = {"purpose": "", "calculations": "", "shaping": ""}
-    if not text:
+    if not text or not text.strip():
         return out
-    # tolerant section parsing
-    patterns = {
-        "purpose": r"PURPOSE:\s*(.+?)(?=\n\s*(?:CALCULATIONS:|SHAPING:)|\Z)",
-        "calculations": r"CALCULATIONS:\s*(.+?)(?=\n\s*(?:PURPOSE:|SHAPING:)|\Z)",
-        "shaping": r"SHAPING:\s*(.+?)(?=\n\s*(?:PURPOSE:|CALCULATIONS:)|\Z)",
+
+    text = text.strip()
+    # strip common code-fence wrappers some models add
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+
+    # Build a flexible label matcher: optional markdown (#, *, digits, dashes)
+    # then the word, then optional punctuation (: - ) etc.
+    def section_pattern(label: str, others: list[str]) -> str:
+        lead = r"(?:^|\n)\s*(?:#{1,6}\s*|\*{1,2}\s*|\d+\.\s*|-\s*)?"
+        name = rf"{label}\s*\*{{0,2}}\s*[:\-\u2013)]*\s*"
+        # stop at the next known section label (any variant) or end
+        stops = "|".join(others + [label])
+        stop = rf"(?=\n\s*(?:#{{1,6}}\s*|\*{{1,2}}\s*|\d+\.\s*|-\s*)?(?:{stops})\b|\Z)"
+        return lead + name + r"(.+?)" + stop
+
+    labels = {
+        "purpose": "PURPOSE",
+        "calculations": "CALCULATION(?:S)?",
+        "shaping": "(?:DATA[ _]?)?SHAPING",
     }
-    for key, pat in patterns.items():
+    all_label_alts = list(labels.values())
+
+    found_any = False
+    for key, lab in labels.items():
+        others = [v for k, v in labels.items() if k != key]
+        pat = section_pattern(lab, others)
         m = re.search(pat, text, re.S | re.I)
         if m:
-            out[key] = " ".join(m.group(1).split())
+            val = " ".join(m.group(1).split()).strip(" :-\u2013*")
+            if val:
+                out[key] = val
+                found_any = True
+
+    # Fallback: model ignored the format entirely. Don't throw the answer away
+    # - keep it as the purpose so the user still sees the model's summary.
+    if not found_any:
+        cleaned = " ".join(text.split())
+        out["purpose"] = cleaned[:1200]
+
     return out
 
 
@@ -612,14 +793,21 @@ def run_llm_pass(scripts: list[ScriptInfo], model: str, cache_path: Path) -> int
             info.llm_shaping_prose = cached.get("shaping", "")
             continue
         prompt = build_llm_prompt(info)
-        print(f"  [LLM] summarizing {info.name} ...", flush=True)
+        print(f"  [LLM] summarizing {info.name} ...", end="", flush=True)
+        _t0 = _time.time()
         response = ollama_generate(model, prompt)
+        _elapsed = _time.time() - _t0
+        print(f" done ({_elapsed:.0f}s)", flush=True)
         calls_made += 1
         parsed = parse_llm_response(response or "")
         info.llm_purpose = parsed["purpose"]
         info.llm_calc_prose = parsed["calculations"]
         info.llm_shaping_prose = parsed["shaping"]
-        cache[cache_key] = parsed
+        # keep the raw response in the cache too, so the parser can be
+        # improved later and re-applied WITHOUT re-calling the model
+        parsed_with_raw = dict(parsed)
+        parsed_with_raw["_raw"] = response or ""
+        cache[cache_key] = parsed_with_raw
         save_cache(cache_path, cache)  # save incrementally so a crash doesn't lose work
     return calls_made
 
@@ -721,6 +909,56 @@ def render_script_section(info: ScriptInfo) -> list[str]:
             lines.append(f"- {t}")
         lines.append("")
 
+    # Code health (v8)
+    h = info.health
+    if h:
+        band = h["maintainability_band"]
+        badge = {"good": "🟢 good",
+                 "moderate": "🟡 moderate",
+                 "needs attention": "🔴 needs attention"}.get(band, band)
+        lines.append("### 🩺 Code health\n")
+        lines.append(f"**Maintainability:** {badge}"
+                     + (f" (index {h['maintainability_index']})"
+                        if h["maintainability_index"] is not None else "")
+                     + "\n")
+        lines.append(
+            f"- {h['code_lines']} code lines, {h['comment_lines']} comment "
+            f"lines ({h['comment_ratio']}% comments), "
+            f"{h['function_count']} function(s)"
+        )
+        lines.append(
+            f"- Most complex function: cyclomatic complexity "
+            f"{h['max_complexity']} · longest function: "
+            f"{h['max_function_length']} lines · deepest nesting: "
+            f"{h['max_nesting']} levels"
+        )
+        lines.append("")
+
+        if h["complex_functions"]:
+            lines.append("**High-complexity functions** (cyclomatic ≥ 10 — "
+                          "harder to test/modify):")
+            for f in h["complex_functions"]:
+                lines.append(f"- `{f['name']}()` — complexity {f['complexity']} "
+                             f"(line {f['lineno']})")
+            lines.append("")
+        if h["long_functions"]:
+            lines.append("**Long functions** (≥ 60 lines — consider splitting):")
+            for f in h["long_functions"]:
+                lines.append(f"- `{f['name']}()` — {f['length']} lines "
+                             f"(line {f['lineno']})")
+            lines.append("")
+        if h["deep_functions"]:
+            lines.append("**Deeply nested functions** (≥ 4 levels — hard to "
+                          "follow):")
+            for f in h["deep_functions"]:
+                lines.append(f"- `{f['name']}()` — {f['nesting']} levels deep "
+                             f"(line {f['lineno']})")
+            lines.append("")
+        if not (h["complex_functions"] or h["long_functions"]
+                or h["deep_functions"]):
+            lines.append("_No functions flagged for complexity, length, or "
+                         "nesting._\n")
+
     lines.append("---\n")
     return lines
 
@@ -768,6 +1006,17 @@ def main():
                              "calculation and shaping explanations)")
     parser.add_argument("--model", default="qwen2.5-coder:7b",
                         help="Ollama model name (default: qwen2.5-coder:7b)")
+    parser.add_argument("--only", default=None, metavar="FILENAME",
+                        help="Summarize ONLY this one script (fast — great for "
+                             "testing). Accepts the filename, e.g. "
+                             "11_generate_laydown_file.py")
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="Summarize only the first N scripts (in sorted "
+                             "order). Useful to keep LLM runtime short.")
+    parser.add_argument("--include-tools", action="store_true",
+                        help="Also analyze analyzer/tooling files "
+                             "(pipeline_analyzer_*.py, analyze_pipeline.py, "
+                             "pyreverse.py). Excluded by default.")
     args = parser.parse_args()
 
     folder = Path(args.folder).resolve()
@@ -776,8 +1025,42 @@ def main():
 
     py_files = sorted(folder.glob("*.py"))
     py_files = [p for p in py_files if p.name != Path(__file__).name]
+
+    # Auto-exclude analyzer/tooling files unless --include-tools is set.
+    # These are the documentation tools themselves, not pipeline scripts.
+    if not args.include_tools:
+        tool_patterns = (
+            re.compile(r"^pipeline_analyzer.*\.py$"),
+            re.compile(r"^analyze_pipeline\.py$"),
+            re.compile(r"^pyreverse\.py$"),
+        )
+        before = len(py_files)
+        py_files = [
+            p for p in py_files
+            if not any(pat.match(p.name) for pat in tool_patterns)
+        ]
+        excluded = before - len(py_files)
+        if excluded:
+            print(f"Excluded {excluded} analyzer/tool file(s) "
+                  f"(use --include-tools to keep them).")
+
     if not py_files:
         raise SystemExit(f"No .py files found in {folder}")
+
+    # --only: keep just the named script
+    if args.only:
+        target = args.only.strip()
+        match = [p for p in py_files if p.name == target]
+        if not match:
+            available = ", ".join(p.name for p in py_files)
+            raise SystemExit(
+                f"--only '{target}' not found. Available: {available}"
+            )
+        py_files = match
+
+    # --limit: first N (applied after --only, so --only always wins)
+    if args.limit is not None and args.limit > 0:
+        py_files = py_files[:args.limit]
 
     print(f"Analyzing {len(py_files)} script(s) ...")
     scripts = [analyze_script(p) for p in py_files]
