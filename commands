@@ -781,6 +781,123 @@ plain-language paragraphs about it, returned as JSON with exactly these keys:
 """
 
 
+def build_pipeline_overview_prompt(scripts: list["ScriptInfo"],
+                                   folder_name: str) -> str:
+    """
+    Second-pass prompt: takes the per-script plain-language summaries that
+    were generated in the first pass and synthesizes them into ONE coherent
+    'Start here' paragraph for the whole pipeline. Same JSON-mode contract.
+
+    The model only sees its own plain-language output from the first pass —
+    no code, no facts, no jargon — so this prompt stays small and the model
+    is just doing summarization-of-summaries.
+    """
+    bullets = []
+    for s in scripts:
+        if s.deliv_plain:
+            # one-line label + the plain-language summary
+            bullets.append(f"- {s.name}: {s.deliv_plain}")
+    bullets_block = "\n".join(bullets) if bullets else "(no summaries available)"
+
+    n = len(scripts)
+    first_name = scripts[0].name if scripts else ""
+    last_name = scripts[-1].name if scripts else ""
+
+    example = """{
+  "overview": "This pipeline turns the planned aircraft assignments into a complete picture of each airfield's readiness. Across 12 steps it gradually combines aircraft information, airfield surveys, fuel and munitions inventories, and hangar capacity into a single set of planning files. The early steps clean and standardize the raw data; the middle steps build per-airfield calculations; the final steps assemble the consolidated outputs that downstream planners use.",
+  "how_to_read": "Each step in this document has a plain-language explanation up top and a 'Technical detail' section underneath for engineers. New analysts should read the plain-language sections in order — they tell the story without needing to read code."
+}"""
+
+    return f"""You are writing the opening 'Start here' section of an
+ONBOARDING guide for a data pipeline. Your readers are new analysts who
+understand the mission but do NOT read code.
+
+Below are short plain-language summaries of each pipeline step (already
+written for the same audience). Read them and write ONE coherent
+paragraph that summarizes what the whole pipeline does and the overall
+flow from start to finish. Avoid code terms. Don't list every step;
+describe the shape of the whole.
+
+Return JSON with exactly these keys:
+  overview     - 3-5 sentences: what the pipeline does end-to-end and why
+  how_to_read  - 1-2 sentences: a friendly note telling new readers how to
+                 use this document (plain-language first, technical detail
+                 collapsible below)
+
+Pipeline: {folder_name} ({n} steps, starting at {first_name}, ending at {last_name})
+
+=== EXAMPLE OUTPUT ===
+{example}
+
+=== PER-STEP PLAIN-LANGUAGE SUMMARIES ===
+{bullets_block}
+
+=== YOUR JSON RESPONSE ===
+"""
+
+
+def parse_pipeline_overview_response(text: str) -> dict[str, str]:
+    """JSON-first parser for the pipeline-overview response."""
+    out = {"overview": "", "how_to_read": ""}
+    if not text or not text.strip():
+        return out
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    candidates = [t]
+    m = re.search(r"\{.*\}", t, re.S)
+    if m and m.group(0) != t:
+        candidates.append(m.group(0))
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                for k in ("overview", "how_to_read"):
+                    v = obj.get(k, "")
+                    if isinstance(v, str):
+                        out[k] = v.strip()
+                if any(out.values()):
+                    return out
+        except Exception:
+            continue
+    return out
+
+
+def run_pipeline_overview_pass(scripts: list["ScriptInfo"], folder_name: str,
+                               model: str, cache_path: Path) -> dict[str, str]:
+    """
+    Run the second-pass overview call. Uses a cache key derived from the
+    concatenated plain-language hashes, so the overview is only re-generated
+    when the underlying per-script summaries change.
+    """
+    if not any(s.deliv_plain for s in scripts):
+        return {"overview": "", "how_to_read": ""}
+    # cache key tied to the inputs that determine the output
+    combined = "|".join(s.deliv_plain for s in scripts)
+    h = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+    cache_key = f"__overview__:{folder_name}:{h}:{model}"
+    cache = load_cache(cache_path)
+    if cache_key in cache:
+        cached = cache[cache_key]
+        return {
+            "overview": cached.get("overview", ""),
+            "how_to_read": cached.get("how_to_read", ""),
+        }
+    prompt = build_pipeline_overview_prompt(scripts, folder_name)
+    print(f"  [LLM] writing pipeline-level overview ...", end="", flush=True)
+    _t0 = _time.time()
+    response = ollama_generate(model, prompt, json_mode=True)
+    _elapsed = _time.time() - _t0
+    print(f" done ({_elapsed:.0f}s, {len(response or '')} chars)", flush=True)
+    parsed = parse_pipeline_overview_response(response or "")
+    parsed_with_raw = dict(parsed)
+    parsed_with_raw["_raw"] = response or ""
+    cache[cache_key] = parsed_with_raw
+    save_cache(cache_path, cache)
+    return parsed
+
+
+
 def _parse_labeled_response(text: str, labels: dict[str, str],
                             fallback_key: str) -> dict[str, str]:
     """
@@ -1119,17 +1236,26 @@ def _plain_title(name: str) -> str:
 
 
 def render_deliverable(scripts: list[ScriptInfo], folder: Path,
-                       llm_used: bool, model: str, calls_made: int) -> str:
+                       llm_used: bool, model: str, calls_made: int,
+                       overview: Optional[dict] = None) -> str:
     """
     Onboarding deliverable: plain-language lead per step, technical detail
     tucked into collapsible <details> blocks. Aimed at a NEW ANALYST who
     knows the mission domain but does not read code.
+
+    `overview` (optional): dict with 'overview' and 'how_to_read' keys from
+    the pipeline-level LLM pass. When present, replaces the templated
+    'Start here' paragraph with synthesized prose about the whole pipeline.
     """
+    overview = overview or {"overview": "", "how_to_read": ""}
     L = []
     L.append(f"# {folder.name}: How This Pipeline Works\n")
-    L.append("_An onboarding guide. Plain-language explanation up top; "
-             "click **“Technical detail”** under any step to see the "
-             "engineering specifics._\n")
+    if overview.get("how_to_read"):
+        L.append(f"_{overview['how_to_read']}_\n")
+    else:
+        L.append("_An onboarding guide. Plain-language explanation up top; "
+                 "click **“Technical detail”** under any step to see the "
+                 "engineering specifics._\n")
 
     if not llm_used:
         L.append(
@@ -1144,12 +1270,20 @@ def render_deliverable(scripts: list[ScriptInfo], folder: Path,
     n = len(scripts)
     first = scripts[0].name if scripts else "the first script"
     last = scripts[-1].name if scripts else "the last script"
-    L.append(
-        f"This pipeline is **{n} steps** that run in order. Each step reads "
-        f"data files, does its part, and writes files the next step picks up — "
-        f"like a relay. You start at `{first}` and finish at `{last}`. "
-        f"You rarely run one step alone; they’re meant to run start to finish.\n"
-    )
+    if overview.get("overview"):
+        # LLM-written pipeline-level paragraph (preferred)
+        L.append(overview["overview"] + "\n")
+        L.append(f"_The pipeline has **{n} steps**, starting at `{first}` "
+                 f"and ending at `{last}`. Run them in order; they're meant "
+                 f"to run start to finish._\n")
+    else:
+        # Templated fallback (used when LLM is off or overview pass failed)
+        L.append(
+            f"This pipeline is **{n} steps** that run in order. Each step reads "
+            f"data files, does its part, and writes files the next step picks up — "
+            f"like a relay. You start at `{first}` and finish at `{last}`. "
+            f"You rarely run one step alone; they’re meant to run start to finish.\n"
+        )
     L.append("**The steps at a glance:**\n")
     L.append("| # | Step | In one sentence |")
     L.append("|---|------|-----------------|")
@@ -1343,6 +1477,7 @@ def main():
 
     llm_used = False
     calls_made = 0
+    overview: dict[str, str] = {"overview": "", "how_to_read": ""}
     if args.llm:
         if ollama_available():
             mode = "onboarding/deliverable" if args.deliverable else "technical"
@@ -1353,6 +1488,12 @@ def main():
             calls_made = run_llm_pass(scripts, args.model, cache_path,
                                       deliverable=args.deliverable)
             llm_used = True
+            # Second pass: pipeline-level overview, deliverable mode only.
+            # Only runs when there's more than one script to summarize.
+            if args.deliverable and len(scripts) > 1:
+                overview = run_pipeline_overview_pass(
+                    scripts, folder.name, args.model, cache_path,
+                )
         else:
             print("⚠️  --llm requested but no Ollama server found at "
                   "localhost:11434.")
@@ -1362,7 +1503,8 @@ def main():
 
     if args.deliverable:
         output = render_deliverable(scripts, folder, llm_used,
-                                    args.model, calls_made)
+                                    args.model, calls_made,
+                                    overview=overview)
     else:
         output = render_markdown(scripts, folder, llm_used,
                                  args.model, calls_made)
