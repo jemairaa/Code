@@ -630,14 +630,25 @@ def ollama_available() -> bool:
         return False
 
 
-def ollama_generate(model: str, prompt: str, timeout: int = 120) -> Optional[str]:
-    """Call the local Ollama server. Returns the response text, or None on failure."""
-    payload = json.dumps({
+def ollama_generate(model: str, prompt: str, timeout: int = 180,
+                    json_mode: bool = False) -> Optional[str]:
+    """
+    Call the local Ollama server. Returns the response text, or None on failure.
+
+    When `json_mode=True`, asks Ollama to constrain output to valid JSON
+    (Ollama's `format: 'json'`). This is what makes deliverable mode reliable
+    on small local models — we get parseable JSON instead of free-form prose
+    in whatever shape the model felt like.
+    """
+    body = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2},
-    }).encode("utf-8")
+        "options": {"temperature": 0.2, "num_predict": 1024},
+    }
+    if json_mode:
+        body["format"] = "json"
+    payload = json.dumps(body).encode("utf-8")
     try:
         req = urllib.request.Request(
             OLLAMA_URL, data=payload,
@@ -705,54 +716,68 @@ SHAPING: <2-4 sentences explaining how the script reshapes/combines/filters data
 
 def build_deliverable_prompt(info: ScriptInfo) -> str:
     """
-    Deliverable/onboarding variant: ask the model for plain-language output
-    aimed at a NEW ANALYST who knows the mission domain but not the code.
-    No pandas jargon, no function names — explain it the way you'd brief a
-    new teammate on their first day.
+    Deliverable/onboarding variant — heavily prompt-engineered for small local
+    models. Three changes from earlier versions:
+      1. NO source code in the prompt (facts only) — keeps the prompt small
+         enough that a 7B model on CPU doesn't time out or return empty.
+      2. Few-shot example shows the model what good plain-language output
+         looks like; a small model imitates an example more reliably than it
+         follows abstract instructions.
+      3. The model is told to emit JSON; we call Ollama with format='json' so
+         the response is guaranteed parseable.
     """
     facts = []
     facts.append(f"Script name: {info.name}")
     if info.files_read:
-        facts.append("Reads files: " + ", ".join(Path(f).name for f in info.files_read))
+        facts.append("Reads (describe what these represent, not file names): "
+                     + ", ".join(Path(f).stem.replace('_', ' ')
+                                 for f in info.files_read))
     if info.files_written:
-        facts.append("Writes files: " + ", ".join(Path(f).name for f in info.files_written))
-    if info.merges:
-        facts.append("Combines these datasets: " + "; ".join(info.merges))
+        facts.append("Produces: "
+                     + ", ".join(Path(f).stem.replace('_', ' ')
+                                 for f in info.files_written))
     if info.calculations:
-        facts.append("Calculations detected:\n  - " + "\n  - ".join(info.calculations))
+        hints = [c[:200] for c in info.calculations[:6]]
+        facts.append("Operations the script performs:\n  - "
+                     + "\n  - ".join(hints))
+    if info.merges:
+        facts.append(f"Number of dataset combinations performed: "
+                     f"{len(info.merges)}")
     if info.section_comments:
-        facts.append("Step comments in order:\n  - " + "\n  - ".join(info.section_comments))
+        # the team's own step comments are the single most useful signal
+        facts.append("The team's own step-by-step comments in the script:\n  - "
+                     + "\n  - ".join(info.section_comments[:25]))
+    if info.todos:
+        facts.append("Known issues/TODOs the team flagged:\n  - "
+                     + "\n  - ".join(info.todos[:5]))
     facts_block = "\n".join(facts)
 
-    src = info.source
-    if len(src) > 8000:
-        src = src[:8000] + "\n# ... (truncated for length) ..."
+    example = """{
+  "plain": "This step combines the planned aircraft list with each aircraft's physical dimensions, then works out how much ramp space every airfield needs once everything is parked. It also pulls in fuel, munitions, and hangar information so the final planning file has everything in one place. It matters because the rest of the pipeline depends on this combined picture to decide whether each base can actually support its assigned aircraft.",
+  "inout": "It takes the planned aircraft assignments and the supporting reference data (aircraft sizes, fuel inventory, munitions storage, hangar capacity, airfield surveys) and produces the consolidated laydown files that summarize each airfield's situation.",
+  "watch": "The team has flagged that duplicate rows are sometimes created for main operating bases - worth double-checking those before relying on totals. The 10% apron reduction for unusable space is a planning assumption, not a measured value."
+}"""
 
-    return f"""You are writing onboarding documentation for a NEW ANALYST joining
-a team. They understand the mission and the data domain, but they do NOT read
-Python and should never need to. Explain this pipeline step the way you would
-brief a new teammate on their first day — in plain language, no code terms, no
-library names, no function names.
+    return f"""You are writing ONBOARDING documentation for a new analyst.
 
-Below are FACTS extracted from the script, then its SOURCE CODE for your
-reference only. Use the facts as ground truth. Never invent data sources.
+Your reader understands the mission and the data, but does NOT read code.
+NEVER use code terms (no "merge", "join", "dataframe", "apply", "groupby",
+"np.where", function names, or column names like "icao" or "df").
+Translate everything into the way you'd brief a teammate on their first day.
 
-=== EXTRACTED FACTS ===
+Below are the FACTS extracted from one pipeline step. Write three short
+plain-language paragraphs about it, returned as JSON with exactly these keys:
+  plain  - 2-4 sentences: what this step does and why it matters
+  inout  - 1-2 sentences: what goes in and what comes out (describe by meaning)
+  watch  - 1-2 sentences: what to be careful of (known issues, assumptions)
+
+=== EXAMPLE OUTPUT (a different aircraft-laydown step) ===
+{example}
+
+=== FACTS FOR THE STEP YOU ARE DOCUMENTING ===
 {facts_block}
 
-=== SOURCE CODE (reference only — do not quote it) ===
-{src}
-
-=== YOUR TASK ===
-Respond in exactly this format, nothing else. Keep every section tight and
-jargon-free. Imagine the reader asking "what does this step do and why should
-I care?"
-
-PLAIN: <2-4 sentences: in plain language, what this step does and why it matters to the overall pipeline. No code terms.>
-
-INOUT: <1-2 sentences: in plain language, what information goes IN and what comes OUT. Describe the data by what it represents, not file names.>
-
-WATCH: <1-2 sentences: what a new analyst should be careful about here — known issues, assumptions, or things that could surprise them. If nothing notable, write "Nothing unusual to flag for this step.">
+=== YOUR JSON RESPONSE ===
 """
 
 
@@ -811,7 +836,38 @@ def parse_llm_response(text: str) -> dict[str, str]:
 
 
 def parse_deliverable_response(text: str) -> dict[str, str]:
-    """Onboarding prose: PLAIN / INOUT / WATCH (tolerant)."""
+    """
+    Onboarding prose parser. The model is called with Ollama's JSON-mode so
+    `text` should already be a JSON object with plain/inout/watch keys. Try
+    that first; fall back to the tolerant label parser if the model still
+    emitted plain prose (e.g. JSON-mode not honoured, older Ollama).
+    """
+    out = {"plain": "", "inout": "", "watch": ""}
+    if not text or not text.strip():
+        return out
+    t = text.strip()
+    # strip code-fence wrappers some models add even in JSON mode
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    # try strict JSON first
+    candidates = [t]
+    # also try extracting the first {...} block in case the model added preamble
+    m = re.search(r"\{.*\}", t, re.S)
+    if m and m.group(0) != t:
+        candidates.append(m.group(0))
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                for k in ("plain", "inout", "watch"):
+                    v = obj.get(k, "")
+                    if isinstance(v, str):
+                        out[k] = v.strip()
+                if any(out.values()):
+                    return out
+        except Exception:
+            continue
+    # last-resort: same tolerant prose parser as before
     return _parse_labeled_response(
         text,
         {
@@ -877,9 +933,10 @@ def run_llm_pass(scripts: list[ScriptInfo], model: str, cache_path: Path,
                   else build_llm_prompt(info))
         print(f"  [LLM] summarizing {info.name} ...", end="", flush=True)
         _t0 = _time.time()
-        response = ollama_generate(model, prompt)
+        # deliverable mode: use Ollama's JSON-mode for reliable parsing
+        response = ollama_generate(model, prompt, json_mode=deliverable)
         _elapsed = _time.time() - _t0
-        print(f" done ({_elapsed:.0f}s)", flush=True)
+        print(f" done ({_elapsed:.0f}s, {len(response or '')} chars)", flush=True)
         calls_made += 1
         if deliverable:
             parsed = parse_deliverable_response(response or "")
