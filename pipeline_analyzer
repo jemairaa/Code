@@ -419,13 +419,8 @@ def generate_excel_report(all_tables: list[dict], fk_hints: dict, output_path: s
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="ATHENA CSV Schema Generator")
-    parser.add_argument("--input_dir", required=True, help="Root folder containing CSV files")
-    parser.add_argument("--output_dir", required=True, help="Folder to write outputs to")
-    args = parser.parse_args()
-
-    input_dir = os.path.abspath(args.input_dir)
-    output_dir = os.path.abspath(args.output_dir)
+    input_dir  = r"C:\Users\648685\BOOZ ALLEN HAMILTON\3D Team - 2 - ATHENA"
+    output_dir = r"C:\Users\648685\Documents"
     os.makedirs(output_dir, exist_ok=True)
 
     # ── Find all CSVs ──────────────────────────
