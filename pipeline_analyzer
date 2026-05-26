@@ -1,324 +1,476 @@
 """
-pipeline_analyzer.py
-
-Walks a folder of numbered Python pipeline scripts (01_*.py, 02_*.py, ...) and
-produces a markdown 'cheat sheet' that explains each script: its functions,
-docstrings, inputs (files read, CLI args, imports), and outputs (files written).
+ATHENA CSV Schema Generator
+----------------------------
+Scans nested folders of CSV files, infers PostgreSQL schemas, and outputs:
+  1. A .sql file with CREATE TABLE statements (athena schema)
+  2. A .xlsx summary report of all columns and inferred types
 
 Usage:
-    python pipeline_analyzer.py /path/to/pipeline_folder
-    python pipeline_analyzer.py /path/to/pipeline_folder -o overview.md
-
-No external dependencies — uses only the standard library.
+    python athena_schema_gen.py --input_dir ./data --output_dir ./output
 """
 
-import argparse
-import ast
+import os
 import re
-from pathlib import Path
-from typing import Optional
+import argparse
+import warnings
+import pandas as pd
+import chardet
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from datetime import datetime
 
+warnings.filterwarnings("ignore")
 
-# ---------- File I/O detection ----------
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+SCHEMA_NAME = "athena"
+MAX_ROWS_FOR_INFERENCE = None  # None = read full file
+VARCHAR_HEADROOM = 1.5         # multiply max string len by this for VARCHAR(n)
 
-# Common patterns that suggest a file is being read or written.
-READ_FUNCS = {
-    "read_csv", "read_excel", "read_parquet", "read_json", "read_pickle",
-    "read_feather", "read_html", "read_sql", "read_table", "load", "loads",
-    "load_workbook", "imread",
-}
-WRITE_FUNCS = {
-    "to_csv", "to_excel", "to_parquet", "to_json", "to_pickle", "to_feather",
-    "to_sql", "to_html", "dump", "dumps", "save", "savefig", "imwrite",
-    "write", "writelines",
-}
+# ─────────────────────────────────────────────
+# TYPE MAPPING: pandas dtype → PostgreSQL type
+# ─────────────────────────────────────────────
+def infer_postgres_type(series: pd.Series) -> str:
+    """
+    Infer the best PostgreSQL type for a pandas Series.
+    Checks (in order):
+      1. Boolean
+      2. Integer (with range-aware sizing)
+      3. Float / Numeric
+      4. Datetime
+      5. UUID
+      6. VARCHAR(n) vs TEXT
+    """
+    col = series.dropna()
 
+    if col.empty:
+        return "TEXT"
 
-class ScriptInfo:
-    """Container for everything we learn about a single script."""
+    # ── 1. Boolean ──────────────────────────────
+    bool_vals = {"true", "false", "yes", "no", "1", "0", "t", "f", "y", "n"}
+    if set(col.astype(str).str.strip().str.lower().unique()).issubset(bool_vals):
+        return "BOOLEAN"
 
-    def __init__(self, path: Path):
-        self.path = path
-        self.name = path.name
-        self.docstring: Optional[str] = None
-        self.imports: list[str] = []          # external libraries
-        self.local_imports: list[str] = []    # imports from sibling files
-        self.functions: list[dict] = []       # {name, args, docstring, lineno}
-        self.classes: list[dict] = []         # {name, methods, docstring}
-        self.files_read: list[str] = []       # detected reads
-        self.files_written: list[str] = []    # detected writes
-        self.cli_args: list[str] = []         # argparse args
-        self.has_main_block: bool = False
-        self.entry_calls: list[str] = []      # top-level function calls
-        self.line_count: int = 0
+    # ── 2. Integer ──────────────────────────────
+    if pd.api.types.is_integer_dtype(col):
+        col_min, col_max = col.min(), col.max()
+        if -32768 <= col_min and col_max <= 32767:
+            return "SMALLINT"
+        elif -2147483648 <= col_min and col_max <= 2147483647:
+            return "INTEGER"
+        else:
+            return "BIGINT"
 
-
-def get_arg_name(arg_node) -> str:
-    """Render a function argument as 'name: type = default' (best effort)."""
-    name = arg_node.arg
-    annotation = ""
-    if arg_node.annotation is not None:
+    # Try coercing object → integer
+    if col.dtype == object:
         try:
-            annotation = f": {ast.unparse(arg_node.annotation)}"
+            coerced = pd.to_numeric(col, errors="raise").astype("Int64")
+            col_min, col_max = coerced.min(), coerced.max()
+            if -32768 <= col_min and col_max <= 32767:
+                return "SMALLINT"
+            elif -2147483648 <= col_min and col_max <= 2147483647:
+                return "INTEGER"
+            else:
+                return "BIGINT"
         except Exception:
-            annotation = ""
-    return f"{name}{annotation}"
+            pass
+
+    # ── 3. Float / Numeric ───────────────────────
+    if pd.api.types.is_float_dtype(col):
+        # Check if values look like they need precision (e.g., money, rates)
+        str_vals = col.astype(str)
+        max_decimal_places = str_vals.apply(
+            lambda x: len(x.split(".")[-1]) if "." in x else 0
+        ).max()
+        if max_decimal_places > 6:
+            return "NUMERIC"
+        return "DOUBLE PRECISION"
+
+    if col.dtype == object:
+        try:
+            pd.to_numeric(col, errors="raise")
+            return "DOUBLE PRECISION"
+        except Exception:
+            pass
+
+    # ── 4. Datetime ──────────────────────────────
+    if pd.api.types.is_datetime64_any_dtype(col):
+        return "TIMESTAMP"
+
+    if col.dtype == object:
+        # Regex patterns for common date/datetime formats
+        date_patterns = [
+            r"^\d{4}-\d{2}-\d{2}$",
+            r"^\d{2}/\d{2}/\d{4}$",
+            r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}",
+        ]
+        sample = col.head(50).astype(str)
+        for pattern in date_patterns:
+            if sample.str.match(pattern).mean() > 0.8:
+                return "TIMESTAMP"
+
+    # ── 5. UUID ──────────────────────────────────
+    if col.dtype == object:
+        uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        sample = col.head(50).astype(str)
+        if sample.str.match(uuid_pattern).mean() > 0.8:
+            return "UUID"
+
+    # ── 6. VARCHAR(n) vs TEXT ────────────────────
+    if col.dtype == object:
+        max_len = col.astype(str).str.len().max()
+        if max_len <= 255:
+            varchar_len = min(int(max_len * VARCHAR_HEADROOM), 255)
+            varchar_len = max(varchar_len, 1)
+            return f"VARCHAR({varchar_len})"
+        return "TEXT"
+
+    return "TEXT"
 
 
-def extract_string_arg(node) -> Optional[str]:
-    """If a call has a string literal as its first arg, return it."""
-    if not node.args:
-        return None
-    first = node.args[0]
-    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        return first.value
-    return None
+# ─────────────────────────────────────────────
+# DETECT ENCODING & DELIMITER
+# ─────────────────────────────────────────────
+def detect_encoding(filepath: str) -> str:
+    with open(filepath, "rb") as f:
+        raw = f.read(100_000)
+    result = chardet.detect(raw)
+    return result.get("encoding") or "utf-8"
 
 
-def looks_like_path(s: str) -> bool:
-    """Heuristic: does this string look like a file path or filename?"""
-    if not s or len(s) > 300:
-        return False
-    if "/" in s or "\\" in s:
-        return True
-    # plain filename like data.csv
-    return bool(re.search(r"\.\w{1,6}$", s))
+def detect_delimiter(filepath: str, encoding: str) -> str:
+    with open(filepath, "r", encoding=encoding, errors="replace") as f:
+        first_line = f.readline()
+    for delim in [",", ";", "\t", "|"]:
+        if delim in first_line:
+            return delim
+    return ","
 
 
-def analyze_script(path: Path, sibling_module_names: set[str]) -> ScriptInfo:
-    """Parse one .py file and pull out everything useful."""
-    info = ScriptInfo(path)
-    source = path.read_text(encoding="utf-8", errors="replace")
-    info.line_count = source.count("\n") + 1
+# ─────────────────────────────────────────────
+# TABLE NAME FROM PATH
+# ─────────────────────────────────────────────
+def path_to_table_name(filepath: str, root_dir: str) -> str:
+    """Convert full relative path to a snake_case table name."""
+    rel = os.path.relpath(filepath, root_dir)
+    no_ext = os.path.splitext(rel)[0]
+    # Replace path separators and spaces with underscores
+    name = re.sub(r"[\/\\]", "_", no_ext)
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_").lower()
+    return name
+
+
+# ─────────────────────────────────────────────
+# ANALYZE A SINGLE CSV
+# ─────────────────────────────────────────────
+def analyze_csv(filepath: str, root_dir: str) -> dict:
+    """
+    Returns a dict with table name, columns, types, nullability,
+    primary key candidates, and any warnings.
+    """
+    result = {
+        "filepath": filepath,
+        "table_name": path_to_table_name(filepath, root_dir),
+        "columns": [],
+        "warnings": [],
+        "error": None,
+    }
 
     try:
-        tree = ast.parse(source, filename=str(path))
-    except SyntaxError as e:
-        info.docstring = f"(could not parse: {e})"
-        return info
+        encoding = detect_encoding(filepath)
+        delimiter = detect_delimiter(filepath, encoding)
 
-    info.docstring = ast.get_docstring(tree)
+        df = pd.read_csv(
+            filepath,
+            encoding=encoding,
+            sep=delimiter,
+            nrows=MAX_ROWS_FOR_INFERENCE,
+            dtype_backend="numpy_nullable",
+            low_memory=False,
+            on_bad_lines="warn",
+        )
 
-    for node in ast.walk(tree):
-        # --- imports ---
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                top = alias.name.split(".")[0]
-                if top in sibling_module_names:
-                    info.local_imports.append(alias.name)
-                else:
-                    info.imports.append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            top = module.split(".")[0]
-            if top in sibling_module_names or node.level > 0:
-                info.local_imports.append(module or "(relative)")
-            else:
-                info.imports.append(module)
+        if df.empty:
+            result["warnings"].append("File has no data rows.")
+            return result
 
-        # --- argparse CLI arguments ---
-        elif isinstance(node, ast.Call):
-            func = node.func
-            attr = func.attr if isinstance(func, ast.Attribute) else None
+        for col_name in df.columns:
+            series = df[col_name]
+            pg_type = infer_postgres_type(series)
+            null_count = series.isna().sum()
+            is_nullable = null_count > 0
+            unique_count = series.nunique()
+            is_pk_candidate = (unique_count == len(df)) and not is_nullable
 
-            if attr == "add_argument":
-                arg_name = extract_string_arg(node)
-                if arg_name:
-                    info.cli_args.append(arg_name)
+            # Flag ambiguous types
+            if pg_type == "TEXT" and series.dropna().astype(str).str.len().max() <= 50:
+                result["warnings"].append(
+                    f"Column '{col_name}' inferred as TEXT but has short values — review manually."
+                )
 
-            # File reads / writes via method calls (df.to_csv, json.load, etc.)
-            if attr in READ_FUNCS:
-                path_arg = extract_string_arg(node)
-                if path_arg and looks_like_path(path_arg):
-                    info.files_read.append(path_arg)
-            elif attr in WRITE_FUNCS:
-                path_arg = extract_string_arg(node)
-                if path_arg and looks_like_path(path_arg):
-                    info.files_written.append(path_arg)
+            result["columns"].append(
+                {
+                    "name": col_name,
+                    "pg_type": pg_type,
+                    "nullable": is_nullable,
+                    "pk_candidate": is_pk_candidate,
+                    "unique_count": unique_count,
+                    "null_count": int(null_count),
+                    "sample_values": list(series.dropna().head(3).astype(str)),
+                }
+            )
 
-            # open(...) calls — check mode for read vs write
-            if isinstance(func, ast.Name) and func.id == "open":
-                path_arg = extract_string_arg(node)
-                if path_arg and looks_like_path(path_arg):
-                    mode = "r"
-                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
-                        mode = str(node.args[1].value)
-                    for kw in node.keywords:
-                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
-                            mode = str(kw.value.value)
-                    if any(c in mode for c in "wax"):
-                        info.files_written.append(path_arg)
-                    else:
-                        info.files_read.append(path_arg)
+    except Exception as e:
+        result["error"] = str(e)
 
-    # --- top-level functions, classes, and main block ---
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-            info.functions.append({
-                "name": node.name,
-                "args": [get_arg_name(a) for a in node.args.args],
-                "docstring": ast.get_docstring(node),
-                "lineno": node.lineno,
-            })
-        elif isinstance(node, ast.ClassDef):
-            methods = [
-                n.name for n in node.body
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-            ]
-            info.classes.append({
-                "name": node.name,
-                "methods": methods,
-                "docstring": ast.get_docstring(node),
-            })
-        elif isinstance(node, ast.If):
-            # Detect `if __name__ == "__main__":`
-            test = node.test
-            if (isinstance(test, ast.Compare)
-                    and isinstance(test.left, ast.Name)
-                    and test.left.id == "__name__"):
-                info.has_main_block = True
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            call = node.value
-            if isinstance(call.func, ast.Name):
-                info.entry_calls.append(call.func.id)
-            elif isinstance(call.func, ast.Attribute):
-                info.entry_calls.append(call.func.attr)
-
-    # Dedupe while preserving order
-    def dedupe(seq):
-        seen = set()
-        return [x for x in seq if not (x in seen or seen.add(x))]
-
-    info.imports = dedupe(info.imports)
-    info.local_imports = dedupe(info.local_imports)
-    info.files_read = dedupe(info.files_read)
-    info.files_written = dedupe(info.files_written)
-    info.cli_args = dedupe(info.cli_args)
-    info.entry_calls = dedupe(info.entry_calls)
-    return info
+    return result
 
 
-# ---------- Markdown rendering ----------
+# ─────────────────────────────────────────────
+# DETECT FOREIGN KEY CANDIDATES
+# ─────────────────────────────────────────────
+def detect_foreign_keys(all_tables: list[dict]) -> dict:
+    """
+    Find column names that appear in multiple tables — potential FK relationships.
+    Returns: { col_name: [table1, table2, ...] }
+    """
+    col_to_tables = {}
+    for table in all_tables:
+        for col in table["columns"]:
+            name = col["name"].lower()
+            col_to_tables.setdefault(name, []).append(table["table_name"])
 
-def render_markdown(scripts: list[ScriptInfo], folder: Path) -> str:
-    lines = []
-    lines.append(f"# Pipeline Overview: `{folder.name}`\n")
-    lines.append(f"_{len(scripts)} scripts analyzed_\n")
+    return {k: v for k, v in col_to_tables.items() if len(v) > 1}
 
-    # ---- Top-level summary table ----
-    lines.append("## Pipeline at a glance\n")
-    lines.append("| # | Script | Purpose (first docstring line) | Reads | Writes |")
-    lines.append("|---|--------|--------------------------------|-------|--------|")
-    for s in scripts:
-        purpose = (s.docstring or "").strip().split("\n")[0][:80] or "_(no docstring)_"
-        reads = ", ".join(s.files_read) or "—"
-        writes = ", ".join(s.files_written) or "—"
-        lines.append(f"| {s.name[:2]} | `{s.name}` | {purpose} | {reads} | {writes} |")
-    lines.append("")
 
-    # ---- Inferred data flow ----
-    lines.append("## Inferred data flow\n")
-    lines.append(
-        "Files written by one script and read by a later script suggest a "
-        "hand-off between them.\n"
-    )
-    write_map: dict[str, str] = {}  # filename -> script that writes it
-    handoffs = []
-    for s in scripts:
-        for f in s.files_written:
-            write_map[Path(f).name] = s.name
-        for f in s.files_read:
-            base = Path(f).name
-            if base in write_map and write_map[base] != s.name:
-                handoffs.append((write_map[base], base, s.name))
-    if handoffs:
-        for producer, filename, consumer in handoffs:
-            lines.append(f"- `{producer}` → **{filename}** → `{consumer}`")
-    else:
-        lines.append("_No file-based hand-offs detected. Pipeline may pass data in-memory, "
-                     "use a shared module, or write to paths built dynamically._")
-    lines.append("")
+# ─────────────────────────────────────────────
+# GENERATE SQL
+# ─────────────────────────────────────────────
+def generate_sql(all_tables: list[dict], fk_hints: dict) -> str:
+    lines = [
+        "-- ============================================================",
+        f"-- ATHENA Schema — Auto-generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "-- Review all types and constraints before running in production",
+        "-- ============================================================",
+        "",
+        f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};",
+        "",
+    ]
 
-    # ---- Per-script detail ----
-    lines.append("## Script-by-script detail\n")
-    for s in scripts:
-        lines.append(f"### `{s.name}` ({s.line_count} lines)\n")
+    for table in all_tables:
+        tname = f"{SCHEMA_NAME}.{table['table_name']}"
 
-        if s.docstring:
-            lines.append(f"> {s.docstring.strip()}\n")
-        else:
-            lines.append("> _No module docstring._\n")
-
-        if s.imports:
-            lines.append(f"**External libraries:** {', '.join(f'`{i}`' for i in s.imports)}\n")
-        if s.local_imports:
-            lines.append(f"**Imports from siblings:** {', '.join(f'`{i}`' for i in s.local_imports)}\n")
-
-        if s.cli_args:
-            lines.append(f"**CLI arguments:** {', '.join(f'`{a}`' for a in s.cli_args)}\n")
-
-        if s.files_read:
-            lines.append("**Reads:**")
-            for f in s.files_read:
-                lines.append(f"- `{f}`")
+        if table["error"]:
+            lines.append(f"-- SKIPPED: {tname} — Error: {table['error']}")
             lines.append("")
-        if s.files_written:
-            lines.append("**Writes:**")
-            for f in s.files_written:
-                lines.append(f"- `{f}`")
+            continue
+
+        if not table["columns"]:
+            lines.append(f"-- SKIPPED: {tname} — No columns found")
             lines.append("")
+            continue
 
-        if s.functions:
-            lines.append("**Functions defined:**")
-            for fn in s.functions:
-                sig = f"`{fn['name']}({', '.join(fn['args'])})`"
-                doc = fn["docstring"].strip().split("\n")[0] if fn["docstring"] else ""
-                lines.append(f"- {sig} — {doc}" if doc else f"- {sig}")
-            lines.append("")
+        lines.append(f"-- Source: {table['filepath']}")
 
-        if s.classes:
-            lines.append("**Classes defined:**")
-            for c in s.classes:
-                methods = ", ".join(c["methods"]) or "_no methods_"
-                lines.append(f"- `{c['name']}` — methods: {methods}")
-            lines.append("")
+        if table["warnings"]:
+            for w in table["warnings"]:
+                lines.append(f"-- WARNING: {w}")
 
-        if s.has_main_block:
-            lines.append("**Has `if __name__ == \"__main__\":` block** — runnable as a script.\n")
-        elif s.entry_calls:
-            lines.append(f"**Top-level calls:** {', '.join(f'`{c}()`' for c in s.entry_calls)}\n")
+        lines.append(f"CREATE TABLE IF NOT EXISTS {tname} (")
 
-        lines.append("---\n")
+        col_lines = []
+        pk_candidates = [c["name"] for c in table["columns"] if c["pk_candidate"]]
+
+        for col in table["columns"]:
+            safe_name = f'"{col["name"]}"'
+            nullable_str = "" if col["nullable"] else " NOT NULL"
+
+            # Annotate FK hints
+            fk_comment = ""
+            if col["name"].lower() in fk_hints:
+                other_tables = [
+                    t for t in fk_hints[col["name"].lower()]
+                    if t != table["table_name"]
+                ]
+                if other_tables:
+                    fk_comment = f"  -- also in: {', '.join(other_tables[:3])}"
+
+            col_lines.append(
+                f"    {safe_name} {col['pg_type']}{nullable_str}{fk_comment}"
+            )
+
+        # Add primary key constraint if exactly one candidate
+        if len(pk_candidates) == 1:
+            pk_col = f'"{pk_candidates[0]}"'
+            col_lines.append(f"    PRIMARY KEY ({pk_col})")
+        elif len(pk_candidates) > 1:
+            lines.append(
+                f"-- NOTE: Multiple PK candidates: {pk_candidates} — add PRIMARY KEY manually"
+            )
+
+        lines.append(",\n".join(col_lines))
+        lines.append(");")
+        lines.append("")
 
     return "\n".join(lines)
 
 
-# ---------- Main ----------
+# ─────────────────────────────────────────────
+# GENERATE EXCEL REPORT
+# ─────────────────────────────────────────────
+def generate_excel_report(all_tables: list[dict], fk_hints: dict, output_path: str):
+    wb = Workbook()
 
+    # ── Summary sheet ──────────────────────────
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    warn_fill = PatternFill("solid", fgColor="FFF2CC")
+    error_fill = PatternFill("solid", fgColor="FFDDC1")
+
+    summary_headers = ["Table Name", "Source File", "Column Count", "Warnings", "Errors"]
+    for col_idx, h in enumerate(summary_headers, 1):
+        cell = ws_summary.cell(row=1, column=col_idx, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, table in enumerate(all_tables, 2):
+        ws_summary.cell(row=row_idx, column=1, value=table["table_name"])
+        ws_summary.cell(row=row_idx, column=2, value=table["filepath"])
+        ws_summary.cell(row=row_idx, column=3, value=len(table["columns"]))
+        ws_summary.cell(row=row_idx, column=4, value="; ".join(table["warnings"]) or "")
+        ws_summary.cell(row=row_idx, column=5, value=table["error"] or "")
+
+        if table["error"]:
+            for c in range(1, 6):
+                ws_summary.cell(row=row_idx, column=c).fill = error_fill
+        elif table["warnings"]:
+            for c in range(1, 6):
+                ws_summary.cell(row=row_idx, column=c).fill = warn_fill
+
+    for col in ws_summary.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws_summary.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    # ── Column detail sheet ────────────────────
+    ws_cols = wb.create_sheet("Column Details")
+    col_headers = [
+        "Table Name", "Column Name", "PostgreSQL Type",
+        "Nullable", "PK Candidate", "Unique Values",
+        "Null Count", "FK Hint (shared columns)", "Sample Values"
+    ]
+    for col_idx, h in enumerate(col_headers, 1):
+        cell = ws_cols.cell(row=1, column=col_idx, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    row_idx = 2
+    for table in all_tables:
+        for col in table["columns"]:
+            fk_tables = fk_hints.get(col["name"].lower(), [])
+            other_fk = [t for t in fk_tables if t != table["table_name"]]
+
+            ws_cols.cell(row=row_idx, column=1, value=table["table_name"])
+            ws_cols.cell(row=row_idx, column=2, value=col["name"])
+            ws_cols.cell(row=row_idx, column=3, value=col["pg_type"])
+            ws_cols.cell(row=row_idx, column=4, value="YES" if col["nullable"] else "NO")
+            ws_cols.cell(row=row_idx, column=5, value="YES" if col["pk_candidate"] else "NO")
+            ws_cols.cell(row=row_idx, column=6, value=col["unique_count"])
+            ws_cols.cell(row=row_idx, column=7, value=col["null_count"])
+            ws_cols.cell(row=row_idx, column=8, value=", ".join(other_fk[:5]) if other_fk else "")
+            ws_cols.cell(row=row_idx, column=9, value=", ".join(col["sample_values"]))
+
+            if col["pk_candidate"]:
+                ws_cols.cell(row=row_idx, column=5).font = Font(bold=True, color="375623")
+
+            row_idx += 1
+
+    for col in ws_cols.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws_cols.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+    # ── FK Hints sheet ─────────────────────────
+    ws_fk = wb.create_sheet("FK Hints")
+    fk_headers = ["Column Name", "Appears In Tables", "Potential Relationship"]
+    for col_idx, h in enumerate(fk_headers, 1):
+        cell = ws_fk.cell(row=1, column=col_idx, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+
+    for row_idx, (col_name, tables) in enumerate(fk_hints.items(), 2):
+        ws_fk.cell(row=row_idx, column=1, value=col_name)
+        ws_fk.cell(row=row_idx, column=2, value=", ".join(tables))
+        ws_fk.cell(row=row_idx, column=3, value="Review for FK relationship")
+
+    for col in ws_fk.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws_fk.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    wb.save(output_path)
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("folder", help="Path to folder containing pipeline .py files")
-    parser.add_argument("-o", "--output", default="pipeline_overview.md",
-                        help="Output markdown file (default: pipeline_overview.md)")
+    parser = argparse.ArgumentParser(description="ATHENA CSV Schema Generator")
+    parser.add_argument("--input_dir", required=True, help="Root folder containing CSV files")
+    parser.add_argument("--output_dir", required=True, help="Folder to write outputs to")
     args = parser.parse_args()
 
-    folder = Path(args.folder).resolve()
-    if not folder.is_dir():
-        raise SystemExit(f"Not a directory: {folder}")
+    input_dir = os.path.abspath(args.input_dir)
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    py_files = sorted(folder.glob("*.py"))
-    py_files = [p for p in py_files if p.name != Path(__file__).name]
-    if not py_files:
-        raise SystemExit(f"No .py files found in {folder}")
+    # ── Find all CSVs ──────────────────────────
+    csv_files = []
+    for root, _, files in os.walk(input_dir):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                csv_files.append(os.path.join(root, f))
 
-    sibling_names = {p.stem for p in py_files}
-    scripts = [analyze_script(p, sibling_names) for p in py_files]
+    print(f"Found {len(csv_files)} CSV files under '{input_dir}'")
 
-    output = render_markdown(scripts, folder)
-    out_path = Path(args.output).resolve()
-    out_path.write_text(output, encoding="utf-8")
-    print(f"Wrote {out_path}")
-    print(f"Analyzed {len(scripts)} script(s).")
+    if not csv_files:
+        print("No CSV files found. Exiting.")
+        return
+
+    # ── Analyze each CSV ───────────────────────
+    all_tables = []
+    for i, filepath in enumerate(csv_files, 1):
+        print(f"  [{i}/{len(csv_files)}] Analyzing: {os.path.relpath(filepath, input_dir)}")
+        result = analyze_csv(filepath, input_dir)
+        all_tables.append(result)
+
+        if result["error"]:
+            print(f"    ⚠ ERROR: {result['error']}")
+        elif result["warnings"]:
+            for w in result["warnings"]:
+                print(f"    ⚠ WARNING: {w}")
+
+    # ── Detect FK hints ────────────────────────
+    fk_hints = detect_foreign_keys(all_tables)
+    print(f"\nDetected {len(fk_hints)} shared column names (potential FK relationships)")
+
+    # ── Write SQL ─────────────────────────────
+    sql_path = os.path.join(output_dir, "athena_schema.sql")
+    sql_content = generate_sql(all_tables, fk_hints)
+    with open(sql_path, "w", encoding="utf-8") as f:
+        f.write(sql_content)
+    print(f"\n✓ SQL written to: {sql_path}")
+
+    # ── Write Excel report ────────────────────
+    xlsx_path = os.path.join(output_dir, "athena_schema_report.xlsx")
+    generate_excel_report(all_tables, fk_hints, xlsx_path)
+    print(f"✓ Excel report written to: {xlsx_path}")
+
+    print("\nDone! Review warnings and FK hints before running the SQL.")
 
 
 if __name__ == "__main__":
