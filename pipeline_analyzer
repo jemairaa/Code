@@ -1,8 +1,12 @@
 """
-Folder of CSVs → SQLite Databases
-----------------------------------
+Folder of CSVs → SQLite Databases (with provenance tracking)
+-------------------------------------------------------------
 Walks a root folder recursively. For every folder that contains CSV files,
-creates a single SQLite .db file in that folder, with one table per CSV.
+creates a SQLite .db file in that folder, with one table per CSV.
+
+Every row in every table gets two extra columns:
+  - source_file: path to the CSV relative to ROOT_FOLDER
+  - loaded_at:   ISO timestamp of when the row was loaded
 
 Rules:
 - One .db per folder at every level (folders without CSVs are skipped)
@@ -13,9 +17,9 @@ Rules:
 
 import pandas as pd
 import sqlite3
-import os
-from pathlib import Path
 import re
+from pathlib import Path
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # CONFIG — update this one line
@@ -25,34 +29,26 @@ ROOT_FOLDER = r"C:\Users\648685\BOOZ ALLEN HAMILTON\3D Team - 2 - ATHENA\athena_
 
 
 def clean_name(name: str) -> str:
-    """
-    Make a string safe to use as a SQL table name.
-    Lowercase, replace non-alphanumerics with underscores, no leading digits.
-    """
+    """Make a string safe to use as a SQL table name."""
     name = name.lower()
-    name = re.sub(r"[^a-z0-9_]", "_", name)   # replace bad chars
-    name = re.sub(r"_+", "_", name).strip("_")  # collapse multiple underscores
+    name = re.sub(r"[^a-z0-9_]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
     if name and name[0].isdigit():
-        name = f"t_{name}"  # prefix if starts with digit
+        name = f"t_{name}"
     return name or "unnamed_table"
 
 
-def load_folder(folder_path: Path) -> dict:
-    """
-    Load all CSVs from a single folder (non-recursive) into a SQLite DB
-    placed in that folder. Returns a summary dict.
-    """
+def load_folder(folder_path: Path, root_path: Path) -> dict:
+    """Load all CSVs from a folder (non-recursive) into a SQLite DB in that folder."""
     csv_files = [f for f in folder_path.iterdir()
                  if f.is_file() and f.suffix.lower() == ".csv"]
 
     if not csv_files:
         return {"folder": str(folder_path), "skipped_no_csvs": True}
 
-    # Name the .db after the folder itself
     db_name = clean_name(folder_path.name) + ".db"
     db_path = folder_path / db_name
 
-    # Overwrite existing .db
     if db_path.exists():
         db_path.unlink()
         print(f"   🗑️  Removed existing {db_name}")
@@ -60,14 +56,28 @@ def load_folder(folder_path: Path) -> dict:
     conn = sqlite3.connect(db_path)
     loaded, failed = [], []
 
+    # Single timestamp for this run, so all rows from the same run match exactly
+    load_timestamp = datetime.now().isoformat(timespec="seconds")
+
     for csv_file in csv_files:
-        table_name = clean_name(csv_file.stem)  # filename without extension
+        table_name = clean_name(csv_file.stem)
         try:
             df = pd.read_csv(csv_file)
+
+            # Compute relative path from ROOT_FOLDER for provenance
+            try:
+                rel_path = str(csv_file.relative_to(root_path))
+            except ValueError:
+                rel_path = str(csv_file)  # fallback if not under root
+
+            # Add provenance columns at the END so original columns stay aligned
+            df["source_file"] = rel_path
+            df["loaded_at"] = load_timestamp
+
             df.to_sql(table_name, conn, if_exists="replace", index=False)
             loaded.append((table_name, len(df), len(df.columns)))
             print(f"   ✅ {csv_file.name} → table '{table_name}' "
-                  f"({len(df):,} rows, {len(df.columns)} cols)")
+                  f"({len(df):,} rows, {len(df.columns) - 2} data cols + 2 provenance)")
         except Exception as e:
             failed.append((csv_file.name, str(e)))
             print(f"   ❌ {csv_file.name} — SKIPPED: {e}")
@@ -93,13 +103,10 @@ def main():
 
     print(f"🔍 Scanning {root} recursively...\n")
 
-    # Collect every folder under root (including root itself)
     all_folders = [root] + [p for p in root.rglob("*") if p.is_dir()]
 
     results = []
     for folder in all_folders:
-        # Skip the folder if it has no CSVs (load_folder will catch this too,
-        # but checking here avoids printing empty headers)
         has_csvs = any(f.suffix.lower() == ".csv"
                        for f in folder.iterdir() if f.is_file())
         if not has_csvs:
@@ -107,7 +114,7 @@ def main():
 
         rel = folder.relative_to(root) if folder != root else Path(".")
         print(f"📁 {rel}")
-        result = load_folder(folder)
+        result = load_folder(folder, root)
         results.append(result)
         print()
 
@@ -120,6 +127,9 @@ def main():
     print(f"Databases created: {len(results)}")
     print(f"Tables loaded:     {total_loaded}")
     print(f"Files skipped:     {total_failed}")
+    print(f"\nEvery table now has these extra columns:")
+    print(f"   - source_file (relative path to original CSV)")
+    print(f"   - loaded_at   (ISO timestamp of this run)")
 
     if total_failed > 0:
         print("\nSkipped files:")
