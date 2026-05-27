@@ -1,104 +1,41 @@
 """
-CSV to PostgreSQL Loader
--------------------------
-Loads a CSV file into a local PostgreSQL database, automatically inferring
-column types from the CSV data. Suitable for small-to-medium files (<100K rows).
-
-Requirements:
-    pip install pandas sqlalchemy psycopg2-binary
-
-Usage:
-    1. Update the CONFIG section below with your database details and CSV path.
-    2. Run: python csv_to_postgres.py
+CSV to SQLite Loader
+--------------------
+Loads a CSV file into a local SQLite database file.
+No server, no install — SQLite is built into Python.
 """
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.exc import SQLAlchemyError
-import sys
+import sqlite3
 
-# =============================================================================
-# CONFIG — update these values
-# =============================================================================
-CSV_PATH = "data.csv"            # Path to your CSV file
-DB_USER = "postgres"             # Your Postgres username
-DB_PASSWORD = "your_password"    # Your Postgres password
-DB_HOST = "localhost"            # Local install
-DB_PORT = "5432"                 # Default Postgres port
-DB_NAME = "your_database"        # Database to load into
-TABLE_NAME = "your_table"        # Target table name
-
-# Behavior options
-IF_EXISTS = "replace"  # Options: "fail", "replace", "append"
-CHUNK_SIZE = 10_000    # Rows per batch insert (good for memory efficiency)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# CONFIG — update these three lines
+# -----------------------------------------------------------------------------
+CSV_PATH = "data.csv"          # path to your CSV
+DB_PATH = "my_data.db"         # SQLite file to create
+TABLE_NAME = "my_table"        # table name inside the database
+# -----------------------------------------------------------------------------
 
 
-def load_csv_to_postgres():
-    """Load a CSV file into a PostgreSQL table."""
+# 1. Read the CSV
+df = pd.read_csv(CSV_PATH)
+print(f"Loaded {len(df)} rows and {len(df.columns)} columns")
+print(f"Columns: {list(df.columns)}")
 
-    # Step 1: Read the CSV
-    print(f"📄 Reading CSV from: {CSV_PATH}")
-    try:
-        df = pd.read_csv(CSV_PATH)
-    except FileNotFoundError:
-        print(f"❌ Error: Could not find CSV at '{CSV_PATH}'")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ Error reading CSV: {e}")
-        sys.exit(1)
+# 2. Open (or create) the SQLite database file
+conn = sqlite3.connect(DB_PATH)
 
-    print(f"✅ Loaded {len(df):,} rows and {len(df.columns)} columns")
-    print(f"   Columns: {list(df.columns)}")
-    print(f"   Inferred dtypes:\n{df.dtypes}\n")
+# 3. Write the DataFrame into a table
+df.to_sql(TABLE_NAME, conn, if_exists="replace", index=False)
+print(f"Wrote {len(df)} rows to table '{TABLE_NAME}' in {DB_PATH}")
 
-    # Step 2: Build the database connection string
-    connection_string = (
-        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}"
-        f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    )
+# 4. Verify — count rows and preview
+row_count = pd.read_sql(f"SELECT COUNT(*) AS n FROM {TABLE_NAME}", conn)
+print(f"\nRow count in database:\n{row_count}")
 
-    # Step 3: Connect and load
-    try:
-        engine = create_engine(connection_string)
+sample = pd.read_sql(f"SELECT * FROM {TABLE_NAME} LIMIT 5", conn)
+print(f"\nFirst 5 rows:\n{sample}")
 
-        # Test the connection first
-        with engine.connect() as conn:
-            print(f"✅ Connected to database: {DB_NAME}")
-
-        # Load the DataFrame into Postgres
-        print(f"📥 Writing to table '{TABLE_NAME}' (mode: {IF_EXISTS})...")
-        df.to_sql(
-            name=TABLE_NAME,
-            con=engine,
-            if_exists=IF_EXISTS,
-            index=False,
-            chunksize=CHUNK_SIZE,
-            method="multi",  # Faster batch inserts
-        )
-
-        # Verify the load
-        inspector = inspect(engine)
-        if TABLE_NAME in inspector.get_table_names():
-            with engine.connect() as conn:
-                from sqlalchemy import text
-                result = conn.execute(text(f"SELECT COUNT(*) FROM {TABLE_NAME}"))
-                row_count = result.scalar()
-            print(f"✅ Success! Table '{TABLE_NAME}' now has {row_count:,} rows.")
-
-            # Show the schema Postgres created
-            columns = inspector.get_columns(TABLE_NAME)
-            print(f"\n📋 Table schema:")
-            for col in columns:
-                print(f"   - {col['name']}: {col['type']}")
-
-    except SQLAlchemyError as e:
-        print(f"❌ Database error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    load_csv_to_postgres()
+# 5. Close the connection
+conn.close()
+print("\nDone.")
