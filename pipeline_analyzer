@@ -1,41 +1,132 @@
 """
-CSV to SQLite Loader
---------------------
-Loads a CSV file into a local SQLite database file.
-No server, no install — SQLite is built into Python.
+Folder of CSVs → SQLite Databases
+----------------------------------
+Walks a root folder recursively. For every folder that contains CSV files,
+creates a single SQLite .db file in that folder, with one table per CSV.
+
+Rules:
+- One .db per folder at every level (folders without CSVs are skipped)
+- Table names = CSV filenames (cleaned: lowercase, underscores)
+- Existing .db files are overwritten each run
+- CSVs that fail to load are skipped with a warning
 """
 
 import pandas as pd
 import sqlite3
+import os
+from pathlib import Path
+import re
 
 # -----------------------------------------------------------------------------
-# CONFIG — update these three lines
+# CONFIG — update this one line
 # -----------------------------------------------------------------------------
-CSV_PATH = "data.csv"          # path to your CSV
-DB_PATH = "my_data.db"         # SQLite file to create
-TABLE_NAME = "my_table"        # table name inside the database
+ROOT_FOLDER = r"C:\Users\648685\BOOZ ALLEN HAMILTON\3D Team - 2 - ATHENA\athena_PACAF_Aug_2025\data"
 # -----------------------------------------------------------------------------
 
 
-# 1. Read the CSV
-df = pd.read_csv(CSV_PATH)
-print(f"Loaded {len(df)} rows and {len(df.columns)} columns")
-print(f"Columns: {list(df.columns)}")
+def clean_name(name: str) -> str:
+    """
+    Make a string safe to use as a SQL table name.
+    Lowercase, replace non-alphanumerics with underscores, no leading digits.
+    """
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9_]", "_", name)   # replace bad chars
+    name = re.sub(r"_+", "_", name).strip("_")  # collapse multiple underscores
+    if name and name[0].isdigit():
+        name = f"t_{name}"  # prefix if starts with digit
+    return name or "unnamed_table"
 
-# 2. Open (or create) the SQLite database file
-conn = sqlite3.connect(DB_PATH)
 
-# 3. Write the DataFrame into a table
-df.to_sql(TABLE_NAME, conn, if_exists="replace", index=False)
-print(f"Wrote {len(df)} rows to table '{TABLE_NAME}' in {DB_PATH}")
+def load_folder(folder_path: Path) -> dict:
+    """
+    Load all CSVs from a single folder (non-recursive) into a SQLite DB
+    placed in that folder. Returns a summary dict.
+    """
+    csv_files = [f for f in folder_path.iterdir()
+                 if f.is_file() and f.suffix.lower() == ".csv"]
 
-# 4. Verify — count rows and preview
-row_count = pd.read_sql(f"SELECT COUNT(*) AS n FROM {TABLE_NAME}", conn)
-print(f"\nRow count in database:\n{row_count}")
+    if not csv_files:
+        return {"folder": str(folder_path), "skipped_no_csvs": True}
 
-sample = pd.read_sql(f"SELECT * FROM {TABLE_NAME} LIMIT 5", conn)
-print(f"\nFirst 5 rows:\n{sample}")
+    # Name the .db after the folder itself
+    db_name = clean_name(folder_path.name) + ".db"
+    db_path = folder_path / db_name
 
-# 5. Close the connection
-conn.close()
-print("\nDone.")
+    # Overwrite existing .db
+    if db_path.exists():
+        db_path.unlink()
+        print(f"   🗑️  Removed existing {db_name}")
+
+    conn = sqlite3.connect(db_path)
+    loaded, failed = [], []
+
+    for csv_file in csv_files:
+        table_name = clean_name(csv_file.stem)  # filename without extension
+        try:
+            df = pd.read_csv(csv_file)
+            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            loaded.append((table_name, len(df), len(df.columns)))
+            print(f"   ✅ {csv_file.name} → table '{table_name}' "
+                  f"({len(df):,} rows, {len(df.columns)} cols)")
+        except Exception as e:
+            failed.append((csv_file.name, str(e)))
+            print(f"   ❌ {csv_file.name} — SKIPPED: {e}")
+
+    conn.close()
+    return {
+        "folder": str(folder_path),
+        "db_path": str(db_path),
+        "loaded": loaded,
+        "failed": failed,
+    }
+
+
+def main():
+    root = Path(ROOT_FOLDER)
+
+    if not root.exists():
+        print(f"❌ Folder not found: {root}")
+        return
+    if not root.is_dir():
+        print(f"❌ Not a folder: {root}")
+        return
+
+    print(f"🔍 Scanning {root} recursively...\n")
+
+    # Collect every folder under root (including root itself)
+    all_folders = [root] + [p for p in root.rglob("*") if p.is_dir()]
+
+    results = []
+    for folder in all_folders:
+        # Skip the folder if it has no CSVs (load_folder will catch this too,
+        # but checking here avoids printing empty headers)
+        has_csvs = any(f.suffix.lower() == ".csv"
+                       for f in folder.iterdir() if f.is_file())
+        if not has_csvs:
+            continue
+
+        rel = folder.relative_to(root) if folder != root else Path(".")
+        print(f"📁 {rel}")
+        result = load_folder(folder)
+        results.append(result)
+        print()
+
+    # ---------------- Summary ----------------
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    total_loaded = sum(len(r.get("loaded", [])) for r in results)
+    total_failed = sum(len(r.get("failed", [])) for r in results)
+    print(f"Databases created: {len(results)}")
+    print(f"Tables loaded:     {total_loaded}")
+    print(f"Files skipped:     {total_failed}")
+
+    if total_failed > 0:
+        print("\nSkipped files:")
+        for r in results:
+            for fname, err in r.get("failed", []):
+                print(f"   - {r['folder']}\\{fname}: {err}")
+
+
+if __name__ == "__main__":
+    main()
